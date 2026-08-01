@@ -1,0 +1,41 @@
+# Reference strict-state ProsQA run. This path is intentionally slower because
+# it does not retain KV or latent history. The original script expects 2 GPUs.
+project: finite-cot
+save_path: ckpts
+name: "prosqa-finite-state-d64-p2-readonly"
+
+only_eval: False
+coconut: True
+cot: False
+no_thoughts: False
+no_cot: False
+
+c_thought: 1
+epochs_per_stage: 25
+max_latent_stage: 4
+pad_latent_to_max: True
+
+finite_state:
+  enabled: True
+  state_dim: 64
+  bits_per_coordinate: 2
+  clip_value: 1.0
+  learnable_clip: False
+  access_mode: readonly_input
+
+save_only_improve: False
+uniform_prob: 0.1
+model_id: configs/symbol-2layer-8head-768dim.json
+load_model_path: None
+seed: 17
+resume: 0
+bf16: False
+train_path: data/prosqa_train_graph_4_coconut.json
+val_path: data/prosqa_valid_graph_4_coconut.json
+reset_optimizer: False
+batch_size_training: 16
+debug: False
+gradient_accumulation_steps: 8
+num_epochs: 300
+lr: !!float "1e-4"
+weight_decay: 0.01

@@ -1,0 +1,18 @@
+base:
+  task: frontier_retrieval
+  model: fixed_hybrid
+  n: 32
+  hidden_dim: 128
+  transcript_vocab_size: 16
+  train_samples: 8192
+  dev_samples: 2048
+  batch_size: 128
+  epochs: 30
+  learning_rate: 0.003
+  train_all_queries: True
+  seed: 17
+  device: auto
+sweep:
+  state_dim: [0, 4, 8, 16, 32]
+  bits: [1, 2, 4]
+  transcript_length: [0, 1, 2, 4, 8]

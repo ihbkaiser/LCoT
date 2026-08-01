@@ -1,0 +1,16 @@
+task: pointer_chase
+nodes: 16
+depth: 4
+updates: 4
+state_dim: 4
+bits: 1
+hidden_dim: 64
+train_samples: 10000
+dev_samples: 2000
+batch_size: 128
+epochs: 25
+learning_rate: 0.003
+weight_decay: 0.0
+seed: 17
+device: auto
+output: results/finite_cot
