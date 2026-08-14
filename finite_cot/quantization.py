@@ -77,6 +77,8 @@ class FiniteScalarQuantizer(nn.Module):
     def quantize(self, x: Tensor) -> QuantizedTensor:
         codes = self.encode(x)
         hard = self.decode(codes, dtype=x.dtype)
+        # QAT: use the hard quantize/dequantize value in the forward pass and
+        # an identity straight-through gradient in the model's floating dtype.
         value = x + (hard - x).detach() if self.training else hard
         return QuantizedTensor(value=value, codes=codes)
 

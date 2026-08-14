@@ -175,8 +175,19 @@ def main():
         },
     )
 
-    if configs.bf16:
-        model.to(torch.bfloat16)
+    training_dtype = getattr(configs, "training_dtype", None)
+    if training_dtype is None:
+        training_dtype = "bfloat16" if configs.bf16 else "float32"
+    dtype_map = {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+    }
+    if training_dtype not in dtype_map:
+        raise ValueError(
+            "training_dtype must be float16, float32, or bfloat16"
+        )
+    model.to(dtype_map[training_dtype])
 
     # if only eval, use ddp (to avoid bugs in fsdp)
     if configs.only_eval:

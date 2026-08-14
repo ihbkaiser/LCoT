@@ -18,6 +18,9 @@ pad_latent_to_max: True
 finite_state:
   enabled: True
   state_dim: 64
+  # QAT uses this hard precision in the forward/model state. The grid varies it.
+  model_bits: 2
+  # Backward-compatible alias for model_bits.
   bits_per_coordinate: 2
   clip_value: 1.0
   learnable_clip: False
@@ -30,6 +33,7 @@ load_model_path: None
 seed: 17
 resume: 0
 bf16: False
+training_dtype: float32
 train_path: data/prosqa_train_graph_4_coconut.json
 val_path: data/prosqa_valid_graph_4_coconut.json
 reset_optimizer: False

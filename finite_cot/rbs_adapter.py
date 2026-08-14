@@ -55,7 +55,11 @@ class StrictFiniteStateCoconut(nn.Module):
         self.bottleneck = FiniteStateBottleneck(
             hidden_size=hidden_size,
             state_dim=int(finite_state["state_dim"]),
-            bits=int(finite_state["bits_per_coordinate"]),
+            bits=int(
+                finite_state.get(
+                    "model_bits", finite_state.get("bits_per_coordinate", 2)
+                )
+            ),
             clip_value=float(finite_state.get("clip_value", 1.0)),
             learnable_clip=bool(finite_state.get("learnable_clip", False)),
         )

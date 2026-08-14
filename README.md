@@ -76,6 +76,23 @@ The original curriculum can still include a zero-latent stage. Do not report
 that stage as a finite-state evaluation; evaluation examples must contain at
 least one latent slot for the bottleneck to apply.
 
+### ProsQA QAT grid search
+
+The strict finite-state quantizer uses hard quantize/dequantize operations at
+`model_bits` in the forward pass and an identity straight-through gradient in
+the configured floating `training_dtype`. Sweep state dimension and model
+precision while holding the training dtype fixed:
+
+```bash
+python experiments/run_prosqa_grid.py args/prosqa_finite_state_grid.yaml --dry-run
+python experiments/run_prosqa_grid.py args/prosqa_finite_state_grid.yaml
+```
+
+Runs execute sequentially and get independent checkpoint directories named
+with `d`, model bits (`mb`), and the training dtype. Generated configs and a
+JSONL manifest are written under `results/prosqa_grid/`. Existing checkpoints
+are resumed by `run.py`.
+
 ## Verification
 
 ```bash
