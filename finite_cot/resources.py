@@ -46,6 +46,7 @@ class ResourceLedger:
         result = asdict(self)
         result.update(
             state_bits=self.state_bits,
+            persistent_bits=self.state_bits,
             transcript_bits=self.transcript_bits,
             retained_summary_bits=self.retained_summary_bits,
         )

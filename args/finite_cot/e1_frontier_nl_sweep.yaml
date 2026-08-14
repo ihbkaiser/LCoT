@@ -1,0 +1,35 @@
+output_dir: results/e1_frontier_nl
+
+base:
+  # E1 definition (fixed for every primary run)
+  model_id: openai-community/gpt2
+  bits: 2
+  transcript_length: 0
+  train_all_queries: false
+  finite_state:
+    enabled: true
+    access_mode: sealed_prefix
+    bits_per_coordinate: 2
+    clip_value: 1.0
+    learnable_clip: false
+
+  # Pilot training budget, not a theorem variable. Every dp point gets this
+  # exact data and compute budget; increase uniformly for a production sweep.
+  train_samples: 4096
+  dev_samples: 1024
+  test_samples: 2048
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  max_steps: 500
+  learning_rate: 0.00005
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  bf16: true
+  device: auto
+  log_every_steps: 25
+
+sweep:
+  n: [16, 32, 64]
+  target_ratio: [0.25, 0.50, 0.75, 0.875, 1.00, 1.125, 1.25]
+  seed: [17, 42, 137]

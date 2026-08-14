@@ -1,0 +1,41 @@
+# Production-strength Experiment E1 sweep.
+#
+# This is intentionally separate from the 500-step pilot configuration.  All
+# capacity points receive exactly the same fixed-step/data/optimizer budget.
+# With batch_size=16 and accumulation=2, 4096 optimization steps expose 131072
+# examples (two passes over the fixed 65536-example training split).
+output_dir: results/e1_frontier_nl_strong
+
+base:
+  # Scientific definition: do not vary these fields within E1.
+  model_id: openai-community/gpt2
+  bits: 2
+  transcript_length: 0
+  train_all_queries: false
+  finite_state:
+    enabled: true
+    access_mode: sealed_prefix
+    bits_per_coordinate: 2
+    clip_value: 1.0
+    learnable_clip: false
+
+  # Uniform training budget (not theorem variables).
+  train_samples: 65536
+  dev_samples: 4096
+  test_samples: 8192
+  batch_size: 16
+  eval_batch_size: 64
+  gradient_accumulation_steps: 2
+  max_steps: 4096
+  learning_rate: 0.00005
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  bf16: true
+  device: auto
+  log_every_steps: 100
+
+sweep:
+  n: [16, 32, 64]
+  target_ratio: [0.25, 0.50, 0.75, 0.875, 1.00, 1.125, 1.25]
+  seed: [17, 42, 137]

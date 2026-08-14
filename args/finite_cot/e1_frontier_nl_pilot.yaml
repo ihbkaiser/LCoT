@@ -1,0 +1,34 @@
+# Small E1-Learned pilot: verify end-to-end learning before the 63-run sweep.
+output_dir: results/e1_frontier_nl_pilot
+
+base:
+  model_id: openai-community/gpt2
+  bits: 2
+  transcript_length: 0
+  train_all_queries: false
+  finite_state:
+    enabled: true
+    access_mode: sealed_prefix
+    bits_per_coordinate: 2
+    clip_value: 1.0
+    learnable_clip: false
+
+  train_samples: 16384
+  dev_samples: 2048
+  test_samples: 4096
+  batch_size: 16
+  eval_batch_size: 64
+  gradient_accumulation_steps: 1
+  max_steps: 1024
+  learning_rate: 0.00005
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  bf16: true
+  device: auto
+  log_every_steps: 50
+
+sweep:
+  n: [16]
+  target_ratio: [0.50, 0.875, 1.00, 1.25]
+  seed: [17]

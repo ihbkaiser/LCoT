@@ -1,0 +1,8 @@
+experiment: E1-Theory
+n: 32
+state_dim: 16
+bits: 2
+seed: 17
+target_ratio: 1.0
+test_samples: 65536
+output_dir: results/e1_theory

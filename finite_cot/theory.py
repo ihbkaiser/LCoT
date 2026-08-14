@@ -21,6 +21,37 @@ def approximate_frontier_bits(n: int, error: float) -> float:
     return n * (1.0 - binary_entropy(error))
 
 
+def h2_inverse(value: float, *, tolerance: float = 1e-12) -> float:
+    """Invert binary entropy on ``[0, 1/2]`` by stable bisection."""
+
+    if not 0.0 <= value <= 1.0:
+        raise ValueError("binary-entropy target must lie in [0, 1]")
+    if tolerance <= 0.0:
+        raise ValueError("tolerance must be positive")
+    if value == 0.0:
+        return 0.0
+    if value == 1.0:
+        return 0.5
+    low, high = 0.0, 0.5
+    while high - low > tolerance:
+        middle = (low + high) / 2.0
+        if binary_entropy(middle) < value:
+            low = middle
+        else:
+            high = middle
+    return (low + high) / 2.0
+
+
+def fano_error_lower_bound(capacity_ratio: float) -> float:
+    """Return ``h2^-1(1-rho)`` for ``rho < 1``, otherwise zero."""
+
+    if capacity_ratio < 0.0:
+        raise ValueError("capacity ratio must be non-negative")
+    if capacity_ratio >= 1.0:
+        return 0.0
+    return h2_inverse(1.0 - capacity_ratio)
+
+
 def transcript_bits(length: int, vocab_size: int, variable_length: bool = False) -> float:
     if length < 0 or vocab_size < 2:
         raise ValueError("invalid transcript parameters")

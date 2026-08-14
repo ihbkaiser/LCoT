@@ -18,11 +18,14 @@ from torch import Tensor, nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers.models.gpt2 import GPT2LMHeadModel
 
-from .quantization import FiniteStateBottleneck
+from .quantization import FiniteStateBottleneck, QuantizedTensor
 from .resources import ResourceLedger
 
 
 Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
+AnswerOnlyOutputs = namedtuple(
+    "AnswerOnlyOutputs", ["loss", "logits", "binary_logits", "state_codes"]
+)
 
 
 class StrictFiniteStateCoconut(nn.Module):
@@ -68,16 +71,152 @@ class StrictFiniteStateCoconut(nn.Module):
         self.last_ledger: ResourceLedger | None = None
         self.gen_forward_cnt = 0
 
-    def _base(self, embeds: Tensor, *, hidden: bool = False):
+    def _base(
+        self,
+        embeds: Tensor,
+        *,
+        attention_mask: Tensor | None = None,
+        hidden: bool = False,
+    ):
         self.gen_forward_cnt += 1
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                embeds.shape[:2], dtype=torch.long, device=embeds.device
+            )
         return self.base_causallm(
             inputs_embeds=embeds,
-            attention_mask=torch.ones(
-                embeds.shape[:2], dtype=torch.long, device=embeds.device
-            ),
+            attention_mask=attention_mask,
             use_cache=False,
             output_hidden_states=hidden,
         )
+
+    def encode_prefix(
+        self, input_ids: Tensor, attention_mask: Tensor | None = None
+    ) -> QuantizedTensor:
+        """Encode a prefix exactly once and return its one hard finite state.
+
+        This API is the strict E1 boundary: it accepts no query and returns no
+        prefix cache or hidden-state object.  The straight-through ``value`` is
+        numerically the global-codebook decoding of ``codes`` in the forward
+        pass; its surrogate gradient only exists to train the encoder.
+        """
+
+        if input_ids.ndim != 2 or input_ids.shape[1] == 0:
+            raise ValueError("prefix input_ids must have shape [batch, length > 0]")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        if attention_mask.shape != input_ids.shape:
+            raise ValueError("prefix attention_mask must match input_ids")
+        lengths = attention_mask.to(torch.long).sum(dim=1)
+        if (lengths <= 0).any():
+            raise ValueError("every E1 prefix must contain at least one token")
+
+        prefix_embeds = self.embedding(input_ids)
+        encoded = self._base(
+            prefix_embeds, attention_mask=attention_mask, hidden=True
+        )
+        rows = torch.arange(input_ids.shape[0], device=input_ids.device)
+        final_hidden = encoded.hidden_states[-1][rows, lengths - 1]
+        state = self.bottleneck.compress(final_hidden)
+        self.last_state_codes = [[code.detach().cpu()] for code in state.codes]
+        self.last_ledger = ResourceLedger(
+            state_dim=self.bottleneck.state_dim,
+            bits_per_coordinate=self.bottleneck.bits,
+            recurrent_updates=0,
+            transcript_length=0,
+            access_model="sealed_prefix",
+            input_reads=1,
+            retains_latent_history=False,
+            notes=(
+                "one latent slot; no past_key_values, prefix hidden states, "
+                "prefix rereads, recurrent updates, or transcript"
+            ),
+        )
+        return state
+
+    def decode_state_query(
+        self,
+        state: Tensor,
+        query_input_ids: Tensor,
+        query_attention_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Return next-token logits from only a hard state and a query.
+
+        ``state`` must be a decoded finite code, normally ``encode_prefix(...).value``.
+        The original prefix is neither accepted nor retained by this method.
+        """
+
+        if state.ndim != 2 or state.shape[1] != self.bottleneck.state_dim:
+            raise ValueError("state has the wrong finite-state shape")
+        if query_input_ids.ndim != 2 or query_input_ids.shape[1] == 0:
+            raise ValueError("query_input_ids must have shape [batch, length > 0]")
+        if query_input_ids.shape[0] != state.shape[0]:
+            raise ValueError("state and query batch sizes must match")
+        if query_attention_mask is None:
+            query_attention_mask = torch.ones_like(query_input_ids)
+        if query_attention_mask.shape != query_input_ids.shape:
+            raise ValueError("query attention_mask must match input_ids")
+        query_lengths = query_attention_mask.to(torch.long).sum(dim=1)
+        if (query_lengths <= 0).any():
+            raise ValueError("every E1 query must contain at least one token")
+
+        state_embed = self.bottleneck.expand(state).unsqueeze(1)
+        query_embeds = self.embedding(query_input_ids)
+        effective = torch.cat((state_embed, query_embeds), dim=1)
+        effective_mask = torch.cat(
+            (
+                torch.ones(
+                    state.shape[0], 1, dtype=query_attention_mask.dtype,
+                    device=query_attention_mask.device,
+                ),
+                query_attention_mask,
+            ),
+            dim=1,
+        )
+        output = self._base(
+            effective, attention_mask=effective_mask, hidden=False
+        )
+        rows = torch.arange(state.shape[0], device=state.device)
+        # Position zero is the state; the last real query token is at
+        # ``query_lengths`` in the effective sequence and predicts the answer.
+        return output.logits[rows, query_lengths]
+
+    def decode_codes_query(
+        self,
+        codes: Tensor,
+        query_input_ids: Tensor,
+        query_attention_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Audit-friendly decoding whose prefix input is literally integer codes."""
+
+        state = self.bottleneck.quantizer.decode(
+            codes, dtype=self.embedding.weight.dtype
+        )
+        return self.decode_state_query(state, query_input_ids, query_attention_mask)
+
+    def forward_answer_only(
+        self,
+        prefix_input_ids: Tensor,
+        prefix_attention_mask: Tensor,
+        query_input_ids: Tensor,
+        query_attention_mask: Tensor,
+        no_token_id: int,
+        yes_token_id: int,
+        targets: Tensor | None = None,
+    ) -> AnswerOnlyOutputs:
+        """E1 forward pass with exactly binary, final-answer supervision."""
+
+        state = self.encode_prefix(prefix_input_ids, prefix_attention_mask)
+        logits = self.decode_state_query(
+            state.value, query_input_ids, query_attention_mask
+        )
+        binary_logits = logits[:, [int(no_token_id), int(yes_token_id)]]
+        loss = (
+            F.cross_entropy(binary_logits, targets.to(torch.long))
+            if targets is not None
+            else None
+        )
+        return AnswerOnlyOutputs(loss, logits, binary_logits, state.codes)
 
     def _trim_example(
         self, input_ids: Tensor, attention_mask: Tensor, labels: Tensor | None
