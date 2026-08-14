@@ -1,0 +1,37 @@
+finite_cot/quantization.py
+  s_d3bb457cfd287e::t_6a55f51d8abc99 80-81
+README.md
+  s_d3bb457cfd287e::t_d50f9e50e945f3 79-80,85-91,93-95
+  s_d3bb457cfd287e::t_6a55f51d8abc99 81-84,92
+args/prosqa_finite_state_grid.yaml
+  s_d3bb457cfd287e::t_6a55f51d8abc99 1,8
+  s_d3bb457cfd287e::t_d50f9e50e945f3 2-3,5-7,9-12
+  s_d3bb457cfd287e::t_42518236fcb48b 4
+run.py
+  s_d3bb457cfd287e::t_2734c737176011 178-190
+finite_cot/rbs_adapter.py
+  s_d3bb457cfd287e::t_d6ea0478ef550e 58-62
+args/prosqa_finite_state_2l_8h_768d.yaml
+  s_d3bb457cfd287e::t_d50f9e50e945f3 21-23
+  s_d3bb457cfd287e::t_6a55f51d8abc99 36
+experiments/run_prosqa_grid.py
+  s_d3bb457cfd287e::t_6a55f51d8abc99 23-25,41,44,82
+  s_d3bb457cfd287e::t_d50f9e50e945f3 1-22,27-40,42,45-81,83-102
+  s_d3bb457cfd287e::t_42518236fcb48b 26,43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "6a167b7531848a6a8c1e22fb3052aa56f530436e",
+  "prompts": {},
+  "sessions": {
+    "s_d3bb457cfd287e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ffef3-73c2-7272-af8f-b42a795bdb1b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "hung20gg <quanghung20gg@gmail.com>"
+    }
+  }
+}
