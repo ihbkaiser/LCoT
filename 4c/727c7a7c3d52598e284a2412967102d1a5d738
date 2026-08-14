@@ -1,0 +1,19 @@
+stokenizer.py
+  s_d3bb457cfd287e::t_e40be7e7bbd7ce 22-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "4c727c7a7c3d52598e284a2412967102d1a5d738",
+  "prompts": {},
+  "sessions": {
+    "s_d3bb457cfd287e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ffef3-73c2-7272-af8f-b42a795bdb1b",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "hung20gg <quanghung20gg@gmail.com>"
+    }
+  }
+}
