@@ -26,9 +26,14 @@ finite_state:
   learnable_clip: False
   access_mode: readonly_input
 
-save_only_improve: False
+save_only_improve: True
 uniform_prob: 0.1
 model_id: configs/symbol-2layer-8head-768dim.json
+# When set, this loads pretrained Hugging Face weights and bypasses model_id.
+# Set to null to retain the randomly initialized local 2-layer model.
+pretrained_model_id: gpt2
+# Use "stokenizer" for the built-in symbolic tokenizer, or a Hugging Face ID.
+tokenizer: stokenizer
 load_model_path: None
 seed: 17
 resume: 0

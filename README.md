@@ -76,6 +76,18 @@ The original curriculum can still include a zero-latent stage. Do not report
 that stage as a finite-state evaluation; evaluation examples must contain at
 least one latent slot for the bottleneck to apply.
 
+Set `pretrained_model_id` to initialize the causal LM from Hugging Face before
+adding the finite-state CCoT bottleneck. This bypasses `model_id`, resizes the
+language-model vocabulary to `STokenizer`, and writes the resolved Hugging Face
+configuration to `<save_path>/<name>/model_config.json`. Set it to `null` to
+construct random weights from the local `model_id` configuration instead.
+
+Set `tokenizer: stokenizer` to use the built-in symbolic tokenizer. Any other
+value is treated as a Hugging Face tokenizer ID. The trainer then registers
+`<|start-latent|>`, `<|end-latent|>`, and `<|latent|>` as additional special
+tokens, configures right padding, resizes the model embeddings, and saves the
+resolved tokenizer under `<save_path>/<name>/tokenizer/`.
+
 ### ProsQA QAT grid search
 
 The strict finite-state quantizer uses hard quantize/dequantize operations at

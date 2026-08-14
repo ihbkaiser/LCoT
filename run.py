@@ -4,7 +4,7 @@
 import torch
 import torch.distributed
 import torch.optim as optim
-from transformers import AutoModelForCausalLM, AutoConfig
+from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 
 from stokenizer import STokenizer
 import wandb
@@ -64,10 +64,12 @@ def main():
 
     torch.distributed.barrier()
     cur_ckpts = os.listdir(save_dir)
+    checkpoints = [f for f in cur_ckpts if f.startswith("checkpoint_")]
+    checkpoints.sort(key=lambda x: int(x.split("_")[1]))
 
     # check if the job is preempted and resumed.
 
-    if len(cur_ckpts) > 0 and not configs.only_eval:
+    if len(checkpoints) > 0 and not configs.only_eval:
         # if there are previous checkpoints, and only_eval is False
         # it means the previous run was preempted and the program is restarted.
         # need to find the latest checkpoint and resume from that.
@@ -77,11 +79,8 @@ def main():
                 f"Warning: found previous run and gonna resume from that. the inputted `resume` argument is ignored!"
             )
 
-        checkpoints = [f for f in cur_ckpts if f.startswith("checkpoint_")]
-        checkpoints.sort(key=lambda x: int(x.split("_")[1]))
-
         # Get the last item in the sorted list
-        latest_checkpoint = checkpoints[-1] if checkpoints else None
+        latest_checkpoint = checkpoints[-1]
         configs.resume = int(latest_checkpoint.split("_")[1])
         load_dir = os.path.join(configs.save_path, configs.name, latest_checkpoint)
 
@@ -100,16 +99,90 @@ def main():
         )
 
     
-    model = AutoModelForCausalLM.from_config(
-        AutoConfig.from_pretrained(configs.model_id)
-    )
-    
-    print(model)
+    tokenizer_id = getattr(configs, "tokenizer", "stokenizer")
+    if tokenizer_id == "stokenizer":
+        tokenizer = STokenizer()
+        if rank == 0:
+            print("Using built-in tokenizer: stokenizer")
+    else:
+        if rank == 0:
+            print(f"Loading tokenizer from Hugging Face: {tokenizer_id}")
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+        special_tokens = {
+            "additional_special_tokens": [
+                "<|start-latent|>",
+                "<|end-latent|>",
+                "<|latent|>",
+            ]
+        }
+        added_tokens = tokenizer.add_special_tokens(special_tokens)
+        if tokenizer.pad_token_id is None:
+            if tokenizer.eos_token_id is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+                pad_message = f"using EOS token {tokenizer.eos_token!r} as padding"
+            else:
+                added_tokens += tokenizer.add_special_tokens(
+                    {"pad_token": "<|pad|>"}
+                )
+                pad_message = "added <|pad|> as padding"
+        else:
+            pad_message = f"using existing padding token {tokenizer.pad_token!r}"
+        tokenizer.padding_side = "right"
+        if rank == 0:
+            print(
+                f"Registered latent special tokens; added {added_tokens} new "
+                f"tokens; {pad_message}"
+            )
+            print(f"Tokenizer vocabulary size: {len(tokenizer)}")
 
-    tokenizer = STokenizer()
     latent_id = tokenizer.convert_tokens_to_ids("<|latent|>")
     start_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
     end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
+
+    pretrained_model_id = getattr(configs, "pretrained_model_id", None)
+    if pretrained_model_id in {None, "None", ""}:
+        if rank == 0:
+            print(
+                "Initializing causal LM from model config: "
+                f"{configs.model_id} (random weights)"
+            )
+        model = AutoModelForCausalLM.from_config(
+            AutoConfig.from_pretrained(configs.model_id)
+        )
+    else:
+        if rank == 0:
+            print(
+                "Loading pretrained causal LM from Hugging Face: "
+                f"{pretrained_model_id}"
+            )
+            print(f"Bypassing model_id config: {configs.model_id}")
+        model = AutoModelForCausalLM.from_pretrained(pretrained_model_id)
+
+    old_vocab_size = model.get_input_embeddings().num_embeddings
+    if old_vocab_size != len(tokenizer):
+        model.resize_token_embeddings(len(tokenizer))
+        if rank == 0:
+            print(
+                f"Resized model token embeddings: {old_vocab_size} -> "
+                f"{len(tokenizer)}"
+            )
+
+    model.config.vocab_size = len(tokenizer)
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
+    model.config.bos_token_id = tokenizer.bos_token_id
+
+    resolved_config_path = os.path.join(save_dir, "model_config.json")
+    if rank == 0:
+        model.config.to_json_file(resolved_config_path, use_diff=False)
+        print(f"Saved resolved model config to: {resolved_config_path}")
+        if tokenizer_id != "stokenizer":
+            tokenizer_path = os.path.join(save_dir, "tokenizer")
+            tokenizer.save_pretrained(tokenizer_path)
+            print(f"Saved resolved tokenizer to: {tokenizer_path}")
+    torch.distributed.barrier()
+
+    print(model)
 
     loaded = False
 
