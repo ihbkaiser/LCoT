@@ -11,6 +11,24 @@ Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
 MAX_N_LATENT = 8
 
 
+def _trim_kv_cache(kv_cache, max_length):
+    """Trim both modern Transformers Cache objects and legacy KV tuples."""
+    if kv_cache is None:
+        return None
+
+    if hasattr(kv_cache, "crop"):
+        kv_cache.crop(max_length)
+        return kv_cache
+
+    return [
+        (
+            layer[0][:, :, :max_length, :],
+            layer[1][:, :, :max_length, :],
+        )
+        for layer in kv_cache
+    ]
+
+
 class Coconut(nn.Module):
 
     def __init__(
@@ -62,7 +80,7 @@ class Coconut(nn.Module):
 
         for pass_idx in range(max_n_latents):
 
-            if kv_cache == None:
+            if kv_cache is None:
                 # first forward pass
                 outputs = self.base_causallm(
                     inputs_embeds=inputs_embeds[
@@ -80,13 +98,9 @@ class Coconut(nn.Module):
 
             else:
                 # extract kv cache to reuse
-                past_key_values = [
-                    (
-                        k[:, :, : next_compute_range[0], :],
-                        v[:, :, : next_compute_range[0], :],
-                    )
-                    for k, v in kv_cache
-                ]
+                past_key_values = _trim_kv_cache(
+                    kv_cache, next_compute_range[0]
+                )
 
                 outputs = self.base_causallm(
                     inputs_embeds=inputs_embeds[
@@ -164,17 +178,9 @@ class Coconut(nn.Module):
             ],
             attention_mask=attention_mask[:, : next_compute_range[1]],
             position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]],
-            past_key_values=(
-                [
-                    (
-                        k[:, :, : next_compute_range[0], :],
-                        v[:, :, : next_compute_range[0], :],
-                    )
-                    for k, v in kv_cache
-                ]
-                if kv_cache
-                else None
-            ),
+            past_key_values = _trim_kv_cache(
+                    kv_cache, next_compute_range[0]
+                ),
             output_hidden_states=True,
         )
 
