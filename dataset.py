@@ -190,9 +190,9 @@ def expand_data(data, k, max_steps, neg_sampling=False):
     else:
         raise ValueError(f"k is {k}, max_steps is {max_steps}")
 
-    if random.random() < 0.05: # debug print
-        print(f"Question: {return_data[0]}")
-        print(f"Continuation: {return_data[1]}")
+    # if random.random() < 0.05: # debug print
+    #     print(f"Question: {return_data[0]}")
+    #     print(f"Continuation: {return_data[1]}")
     
     return return_data
 
