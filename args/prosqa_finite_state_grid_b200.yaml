@@ -1,0 +1,27 @@
+# Six-run QAT grid for two 180-GB B200 GPUs.
+# Use run_parallel_grid_b200.sh to run three one-process jobs per GPU.
+base_config: args/prosqa_finite_state_2l_8h_768d.yaml
+name_prefix: prosqa-finite-state-readonly-qat-b200
+output_dir: results/prosqa_grid_b200
+nproc_per_node: 1
+
+overrides:
+  # Keep the preset runnable on an offline cluster. Set this to a local GPT-2
+  # directory if pretrained weights are required.
+  pretrained_model_id: null
+  distributed_strategy: ddp
+  batch_size_training: 128
+  gradient_accumulation_steps: 1
+  num_workers: 2
+  prefetch_factor: 2
+  pin_memory: true
+  attention_backend: sdpa
+  allow_tf32: true
+  float32_matmul_precision: high
+  fused_optimizer: true
+
+training_dtype: bfloat16
+
+grid:
+  state_dim: [16, 32, 64]
+  model_bits: [4, 8]

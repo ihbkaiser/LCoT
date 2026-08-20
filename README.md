@@ -124,6 +124,22 @@ Dotted nested keys such as `finite_state.access_mode` are also supported. Each
 manifest entry includes the exact `grid_values`, generated config path,
 `checkpoint_dir`, and launch command.
 
+### Parallel two-B200 finite-state grid
+
+For two 180-GB B200 GPUs, use the six-run preset and launcher:
+
+```bash
+./run_parallel_grid_b200.sh
+```
+
+The launcher generates six configs, starts one process per GPU per config, and
+round-robins three configs onto each GPU. It uses the offline local-model path,
+BF16, and a starting training batch of 128 per process. Logs are written under
+`results/prosqa_grid_b200/logs/`. Override `GPU_IDS`, `BASE_PORT`, or
+`OMP_NUM_THREADS` when the node requires different values. Increase
+`batch_size_training` in `args/prosqa_finite_state_grid_b200.yaml` only after
+checking the aggregate memory of the three concurrent jobs on each GPU.
+
 ## Verification
 
 ```bash

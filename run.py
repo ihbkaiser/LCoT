@@ -379,11 +379,21 @@ def main():
             use_orig_params=True,
         )
     else:
+        # The strict finite-state readonly_input path intentionally does not
+        # use the sealed-prefix transition parameters. Let DDP account for
+        # those unused parameters instead of failing on the next iteration.
+        finite_state_config = getattr(configs, "finite_state", {}) or {}
+        find_unused_parameters = bool(
+            finite_state_config.get("enabled", False)
+            and finite_state_config.get("access_mode", "readonly_input")
+            == "readonly_input"
+        )
         parallel_model = DDP(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
             gradient_as_bucket_view=True,
+            find_unused_parameters=find_unused_parameters,
         )
 
     del model
