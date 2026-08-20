@@ -8,7 +8,6 @@ from collections import namedtuple
 from transformers.models.gpt2 import GPT2LMHeadModel
 
 Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
-MAX_N_LATENT = 8
 
 
 def _trim_kv_cache(kv_cache, max_length):
@@ -54,26 +53,42 @@ class Coconut(nn.Module):
         else:
             self.embedding = self.base_causallm.get_input_embeddings()
 
-    def forward(self, input_ids, attention_mask, labels, position_ids, **kwargs):
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        labels=None,
+        position_ids=None,
+        **kwargs,
+    ):
 
         logits = []
 
-        latent_indices = (
-            input_ids == self.latent_token_id
-        ).nonzero()  # (num_latent_tokens_in_the_batch, 2)
+        if position_ids is None:
+            position_ids = attention_mask.long().cumsum(dim=-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 0)
 
-        latent_lists = [
-            [idx[1].item() for idx in latent_indices if idx[0] == i]
-            for i in range(input_ids.shape[0])
-        ]  # bs, num_latent_tokens_in_the_instance (difference across the batch)
-
-        max_n_latents = max([len(l) for l in latent_lists])
+        # Keep all latent bookkeeping on the GPU.  The previous nested Python
+        # loops called ``.item()`` for every latent token and rebuilt the full
+        # [batch, sequence, hidden] tensor as a list at every recurrent step.
+        latent_mask = input_ids.eq(self.latent_token_id)
+        latent_counts = latent_mask.sum(dim=1)
+        max_n_latents = int(latent_counts.max().item())
+        sequence_positions = torch.arange(
+            input_ids.shape[1], device=input_ids.device
+        ).expand_as(input_ids)
+        latent_positions = sequence_positions.masked_fill(
+            ~latent_mask, input_ids.shape[1]
+        ).sort(dim=1).values
 
         next_compute_range = (0, input_ids.shape[1])
         inputs_embeds = self.embedding(input_ids)
 
         if max_n_latents > 0:
-            next_compute_range = (0, latent_indices[:, 1].min().item())
+            next_compute_range = (
+                0,
+                int(latent_positions[:, 0].min().item()),
+            )
             # before the earliest latent token position
 
         kv_cache = None
@@ -138,38 +153,21 @@ class Coconut(nn.Module):
             # feedback the continuous thoughts to the input_embeds
 
             # first decide the positions to feedback
-            filling_indices = [
-                (instance_idx, mask_list[pass_idx])
-                for instance_idx, mask_list in enumerate(latent_lists)
-                if len(mask_list) > pass_idx
+            active_rows = torch.nonzero(
+                latent_counts > pass_idx, as_tuple=False
+            ).squeeze(1)
+            token_indices = latent_positions[active_rows, pass_idx]
+            replacement = hidden_states[
+                active_rows,
+                token_indices - 1 - hidden_states_offset,
+                :,
             ]
 
-            # to avoid in-place operations
-            # break down inputs_embeds (bs, len, hidden_size) into a list of list of 1-d tensors
-            tensor_list = [
-                [
-                    inputs_embeds[batch_idx, pos, :]
-                    for pos in range(inputs_embeds.shape[1])
-                ]
-                for batch_idx in range(inputs_embeds.shape[0])
-            ]
-
-            # replace some of them with continuous thoughts
-            for idx_pair in filling_indices:
-                batch_idx, token_idx = idx_pair
-
-                # replace it with the preceding last hidden states
-                tensor_list[batch_idx][token_idx] = hidden_states[
-                    batch_idx, token_idx - 1 - hidden_states_offset, :
-                ]
-
-            # assemble the new inputs_embeds
-            inputs_embeds = torch.stack(
-                [
-                    torch.stack(tensor_list[batch_idx])
-                    for batch_idx in range(inputs_embeds.shape[0])
-                ]
-            )
+            # Clone once to avoid mutating a tensor needed by autograd, then use
+            # one GPU index operation instead of O(batch * sequence) Python ops.
+            updated_embeds = inputs_embeds.clone()
+            updated_embeds[active_rows, token_indices, :] = replacement
+            inputs_embeds = updated_embeds
 
         # final pass
         outputs = self.base_causallm(
@@ -178,10 +176,8 @@ class Coconut(nn.Module):
             ],
             attention_mask=attention_mask[:, : next_compute_range[1]],
             position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]],
-            past_key_values = _trim_kv_cache(
-                    kv_cache, next_compute_range[0]
-                ),
-            output_hidden_states=True,
+            past_key_values=_trim_kv_cache(kv_cache, next_compute_range[0]),
+            output_hidden_states=False,
         )
 
         logits.append(outputs.logits)
@@ -189,25 +185,26 @@ class Coconut(nn.Module):
         self.gen_forward_cnt += max_n_latents + 1
 
         logits = torch.cat(logits, dim=-2)
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        loss_fct = CrossEntropyLoss()
-        loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-        )
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            )
 
         return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
 
-    def train(self):
-        self.base_causallm.train()
-
-    def eval(self):
-        self.base_causallm.eval()
+    def train(self, mode=True):
+        # Preserve nn.Module semantics so DDP/FSDP and ``eval()`` can recurse
+        # through the complete wrapper correctly.
+        return super().train(mode)
 
     def generate(
         self,
         input_ids,
-        attention_mask,  # attention_mask is not used
+        attention_mask,
         max_new_tokens=16,
         output_embedding=False,
         synced_gpus=False,
@@ -216,53 +213,94 @@ class Coconut(nn.Module):
 
         self.gen_forward_cnt = 0
 
-        assert input_ids.shape[0] == 1, "only support batch_size == 1 now"
-
-        tokens = input_ids[0].detach().tolist()
-
-        labels = input_ids.clone()  # placeholder. not used.
+        batch_size = input_ids.shape[0]
         outputs = self.forward(
             input_ids,
-            torch.ones_like(input_ids, device=input_ids.device),
-            labels,
-            torch.arange(
-                0, input_ids.shape[1], dtype=torch.long, device=input_ids.device
-            ).reshape(1, -1),
+            attention_mask,
+            labels=None,
         )
         inputs_embeds = outputs.inputs_embeds
+        rows = torch.arange(batch_size, device=input_ids.device)
+        last_prompt_positions = (
+            torch.arange(input_ids.shape[1], device=input_ids.device)
+            .expand_as(input_ids)
+            .masked_fill(attention_mask == 0, -1)
+            .max(dim=1)
+            .values
+        )
+        next_tokens = outputs.logits[rows, last_prompt_positions].argmax(dim=-1)
+        generated = [next_tokens]
+        finished = next_tokens.eq(self.eos_token_id)
 
-        # get the first token using the current hidden state
-        next_token = torch.argmax(outputs.logits[0, -1]).item()
-        tokens.append(next_token)
-        new_token_embed = self.embedding(
-            torch.tensor(next_token, device=input_ids.device)
-        ).view(1, 1, -1)
-        new_inputs_embeds = torch.cat((inputs_embeds, new_token_embed), dim=1)
+        # Right-padded prompts can still be decoded together: padded positions
+        # are masked, while generated positions receive their logical position.
+        initial_decode_embeds = torch.cat(
+            (inputs_embeds, self.embedding(next_tokens).unsqueeze(1)), dim=1
+        )
+        next_decode_embed = initial_decode_embeds[:, -1:, :]
+        all_decode_embeds = initial_decode_embeds if output_embedding else None
+        decode_mask = torch.cat(
+            (
+                attention_mask,
+                torch.ones(
+                    (batch_size, 1),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                ),
+            ),
+            dim=1,
+        )
+        prompt_lengths = attention_mask.sum(dim=1)
+        decode_positions = torch.cat(
+            (
+                (attention_mask.long().cumsum(dim=-1) - 1).clamp_min(0),
+                prompt_lengths.unsqueeze(1),
+            ),
+            dim=1,
+        )
+        past_key_values = None
 
-        # get other tokens
-        for _ in range(max_new_tokens - 1):
-            outputs = self.base_causallm(inputs_embeds=new_inputs_embeds)
+        for token_step in range(1, max_new_tokens):
+            if past_key_values is None:
+                decoded = self.base_causallm(
+                    inputs_embeds=initial_decode_embeds,
+                    attention_mask=decode_mask,
+                    position_ids=decode_positions,
+                    use_cache=True,
+                )
+            else:
+                decoded = self.base_causallm(
+                    inputs_embeds=next_decode_embed,
+                    attention_mask=decode_mask,
+                    position_ids=decode_positions[:, -1:],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
             self.gen_forward_cnt += 1
-            next_token = torch.argmax(outputs.logits[0, -1]).item()
-            if next_token == self.eos_token_id:
+            past_key_values = decoded.past_key_values
+            next_tokens = decoded.logits[:, -1, :].argmax(dim=-1)
+            next_tokens = torch.where(
+                finished,
+                torch.full_like(next_tokens, self.eos_token_id),
+                next_tokens,
+            )
+            generated.append(next_tokens)
+            finished.logical_or_(next_tokens.eq(self.eos_token_id))
+
+            next_decode_embed = self.embedding(next_tokens).unsqueeze(1)
+            if output_embedding:
+                all_decode_embeds = torch.cat(
+                    (all_decode_embeds, next_decode_embed), dim=1
+                )
+            decode_mask = torch.cat(
+                (decode_mask, torch.ones_like(decode_mask[:, :1])), dim=1
+            )
+            decode_positions = torch.cat(
+                (decode_positions, (prompt_lengths + token_step).unsqueeze(1)), dim=1
+            )
+            if finished.all() and not synced_gpus:
                 break
-            tokens.append(next_token)
-            new_token_embed = self.embedding(
-                torch.tensor(next_token, device=input_ids.device)
-            ).view(1, 1, -1)
-            new_inputs_embeds = torch.cat((new_inputs_embeds, new_token_embed), dim=1)
 
-        if synced_gpus:
-            # in FSDP, the number of forward pass need to be the same across devices
-            while (
-                self.gen_forward_cnt < max_new_tokens + MAX_N_LATENT
-            ):  # leave some room for latent tokens
-                self.gen_forward_cnt += 1
-                _ = self.base_causallm(inputs_embeds=new_inputs_embeds)
-
-        if output_embedding:
-            # for analysis purpose
-            return torch.tensor(tokens).view(1, -1), new_inputs_embeds
-
-        else:
-            return torch.tensor(tokens).view(1, -1)
+        generated_tokens = torch.stack(generated, dim=1)
+        tokens = torch.cat((input_ids, generated_tokens), dim=1)
+        return (tokens, all_decode_embeds) if output_embedding else tokens

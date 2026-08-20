@@ -3,7 +3,10 @@
 base_config: args/prosqa_finite_state_2l_8h_768d.yaml
 name_prefix: prosqa-finite-state-readonly-qat
 output_dir: results/prosqa_grid
-nproc_per_node: 1
+nproc_per_node: 4
+
+overrides:
+  distributed_strategy: ddp
 
 training_dtype: float32
 

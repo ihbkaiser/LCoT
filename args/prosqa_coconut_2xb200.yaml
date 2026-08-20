@@ -1,0 +1,54 @@
+# High-throughput preset for one node with two NVIDIA B200 GPUs.
+# Effective global batch = 1024 samples/GPU * 2 GPUs = 2048.
+project: coconut
+save_path: ckpts
+name: "prosqa-coconut-2xb200-bf16"
+
+only_eval: False
+coconut: True
+cot: False
+no_thoughts: False
+no_cot: False
+
+c_thought: 1
+epochs_per_stage: 25
+max_latent_stage: 4
+pad_latent_to_max: True
+
+save_only_improve: False
+uniform_prob: 0.1
+model_id: configs/symbol-2layer-8head-768dim.json
+pretrained_model_id: null
+tokenizer: stokenizer
+load_model_path: None
+seed: 0
+resume: 0
+
+# B200 fast path. DDP is faster than parameter sharding for this small model.
+distributed_strategy: ddp
+training_dtype: bfloat16
+attention_backend: sdpa
+allow_tf32: true
+float32_matmul_precision: high
+fused_optimizer: true
+gradient_checkpointing: false
+
+# Increase this until VRAM is ~85-90% occupied. The supplied model is small,
+# so 1024/GPU is a conservative B200 starting point rather than a hard limit.
+batch_size_training: 1024
+batch_size_eval: 256
+gradient_accumulation_steps: 1
+pad_to_multiple_of: 8
+num_workers: 4
+prefetch_factor: 2
+pin_memory: true
+log_every_steps: 10
+log_data_examples: 2
+
+debug: False
+num_epochs: 300
+lr: !!float "1e-4"
+weight_decay: 0.01
+train_path: data/prosqa_train_graph_4_coconut.json
+val_path: data/prosqa_valid_graph_4_coconut.json
+reset_optimizer: False

@@ -10,12 +10,16 @@ from stokenizer import STokenizer
 import wandb
 
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    FullStateDictConfig,
+    StateDictType,
+)
 import torch.distributed as dist
+from torch.utils.data import Sampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 
 from coconut import Coconut
 from finite_cot.rbs_adapter import StrictFiniteStateCoconut
@@ -35,18 +39,83 @@ import json
 import gc
 import argparse
 import functools
+from contextlib import nullcontext
 from utils import Config, set_seed
+
+
+class DistributedEvalSampler(Sampler):
+    """Shard evaluation without padding/duplicating samples across ranks."""
+
+    def __init__(self, dataset, rank, world_size):
+        self.dataset = dataset
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self):
+        remaining = len(self.dataset) - self.rank
+        return max(0, (remaining + self.world_size - 1) // self.world_size)
+
+
+def make_dataloader(
+    dataset,
+    *,
+    batch_size,
+    collator,
+    sampler,
+    configs,
+):
+    """Build a pinned, reusable input pipeline from config knobs."""
+
+    num_workers = int(getattr(configs, "num_workers", 0))
+    kwargs = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "collate_fn": collator,
+        "sampler": sampler,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": bool(getattr(configs, "pin_memory", True)),
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = int(getattr(configs, "prefetch_factor", 2))
+    return torch.utils.data.DataLoader(**kwargs)
+
+
+def move_batch_to_device(batch, device):
+    return {
+        key: value.to(device, non_blocking=True)
+        for key, value in batch.items()
+        if key != "idx" and value is not None
+    }
+
+
+def state_dict_for_save(parallel_model, strategy):
+    """Return a loadable checkpoint without gathering it onto every GPU."""
+
+    if strategy == "fsdp":
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(
+            parallel_model, StateDictType.FULL_STATE_DICT, save_policy
+        ):
+            return parallel_model.state_dict()
+    return parallel_model.module.state_dict()
 
 def main():
     parser = argparse.ArgumentParser(description="coconut")
     parser.add_argument("config_file")
     args = parser.parse_args()
     # init distributed environment
-    dist.init_process_group("nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        "nccl", device_id=torch.device("cuda", local_rank)
+    )
 
     # load the configuration file
     with open(args.config_file) as f:
@@ -57,6 +126,13 @@ def main():
 
     configs = Config(config_dict)
     set_seed(configs.seed)
+    torch.set_float32_matmul_precision(
+        getattr(configs, "float32_matmul_precision", "high")
+    )
+    torch.backends.cuda.matmul.allow_tf32 = bool(
+        getattr(configs, "allow_tf32", True)
+    )
+    torch.backends.cudnn.allow_tf32 = bool(getattr(configs, "allow_tf32", True))
     save_dir = os.path.join(configs.save_path, configs.name)
 
     if not os.path.exists(save_dir) and rank == 0:
@@ -140,15 +216,20 @@ def main():
     end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
 
     pretrained_model_id = getattr(configs, "pretrained_model_id", None)
+    attention_backend = getattr(configs, "attention_backend", None)
+    model_kwargs = (
+        {"attn_implementation": attention_backend}
+        if attention_backend not in {None, "", "auto"}
+        else {}
+    )
     if pretrained_model_id in {None, "None", ""}:
         if rank == 0:
             print(
                 "Initializing causal LM from model config: "
                 f"{configs.model_id} (random weights)"
             )
-        model = AutoModelForCausalLM.from_config(
-            AutoConfig.from_pretrained(configs.model_id)
-        )
+        model_config = AutoConfig.from_pretrained(configs.model_id)
+        model = AutoModelForCausalLM.from_config(model_config, **model_kwargs)
     else:
         if rank == 0:
             print(
@@ -156,7 +237,9 @@ def main():
                 f"{pretrained_model_id}"
             )
             print(f"Bypassing model_id config: {configs.model_id}")
-        model = AutoModelForCausalLM.from_pretrained(pretrained_model_id)
+        model = AutoModelForCausalLM.from_pretrained(
+            pretrained_model_id, **model_kwargs
+        )
 
     old_vocab_size = model.get_input_embeddings().num_embeddings
     if old_vocab_size != len(tokenizer):
@@ -182,13 +265,16 @@ def main():
             print(f"Saved resolved tokenizer to: {tokenizer_path}")
     torch.distributed.barrier()
 
-    print(model)
+    if rank == 0:
+        print(model)
 
     loaded = False
 
     if configs.load_model_path != "None":
         saved_weights = torch.load(
-            configs.load_model_path, map_location=torch.device(rank)
+            configs.load_model_path,
+            map_location="cpu",
+            weights_only=True,
         )
 
         if configs.coconut and not any(
@@ -237,8 +323,31 @@ def main():
     if configs.load_model_path != "None" and not loaded:
         print(model.load_state_dict(saved_weights, strict=False))
 
-    print(f"Running FSDP on rank = {rank}, world size = {world_size}")
-    model = model.to(rank)
+    distributed_strategy = str(
+        getattr(configs, "distributed_strategy", "fsdp")
+    ).lower()
+    if distributed_strategy not in {"ddp", "fsdp"}:
+        raise ValueError("distributed_strategy must be 'ddp' or 'fsdp'")
+
+    if bool(getattr(configs, "gradient_checkpointing", False)):
+        if isinstance(model, Coconut):
+            raise ValueError(
+                "gradient checkpointing is incompatible with Coconut's "
+                "training-time latent KV cache; use FSDP or a smaller batch"
+            )
+        base_model = model.base_causallm if hasattr(model, "base_causallm") else model
+        if not hasattr(base_model, "gradient_checkpointing_enable"):
+            raise ValueError("this model does not support gradient checkpointing")
+        base_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        base_model.config.use_cache = False
+
+    print(
+        f"Running {distributed_strategy.upper()} on rank={rank}, "
+        f"local_rank={local_rank}, world_size={world_size}"
+    )
+    model = model.to(local_rank)
 
     llama_auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
@@ -262,13 +371,19 @@ def main():
         )
     model.to(dtype_map[training_dtype])
 
-    # if only eval, use ddp (to avoid bugs in fsdp)
-    if configs.only_eval:
-        parallel_model = DDP(model, device_ids=[rank])
-
-    else:
+    if distributed_strategy == "fsdp" and not configs.only_eval:
         parallel_model = FSDP(
-            model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank
+            model,
+            auto_wrap_policy=llama_auto_wrap_policy,
+            device_id=local_rank,
+            use_orig_params=True,
+        )
+    else:
+        parallel_model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            gradient_as_bucket_view=True,
         )
 
     del model
@@ -300,18 +415,25 @@ def main():
         parallel_model.parameters(),
         lr=configs.lr,
         weight_decay=configs.weight_decay,
+        fused=bool(getattr(configs, "fused_optimizer", True)),
     )
 
     best_acc = 0
 
-    collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
+    collator = MyCollator(
+        tokenizer,
+        latent_id=latent_id,
+        label_pad_token_id=-100,
+        pad_to_multiple_of=getattr(configs, "pad_to_multiple_of", None),
+    )
 
     for epoch in range(configs.resume, configs.num_epochs):
         
         scheduled_stage = (
             0 if (configs.cot or configs.no_cot) else epoch // configs.epochs_per_stage
         )
-        print("scheduled_stage", scheduled_stage)
+        if rank == 0:
+            print("scheduled_stage", scheduled_stage)
         
         if True:
             if configs.cot or configs.no_cot:
@@ -328,13 +450,25 @@ def main():
                     tokenizer,
                 )
 
-            valid_gen_dataloader = torch.utils.data.DataLoader(
+            valid_gen_sampler = DistributedEvalSampler(
                 dataset_gen_val,
-                num_workers=1,
-                pin_memory=True,
-                batch_size=1,
-                collate_fn=collator,
-                sampler=DistributedSampler(dataset_gen_val, shuffle=False),
+                rank=rank,
+                world_size=world_size,
+            )
+            finite_state_enabled = bool(
+                (getattr(configs, "finite_state", {}) or {}).get("enabled", False)
+            )
+            eval_batch_size = int(getattr(configs, "batch_size_eval", 1))
+            # The strict reference adapter intentionally processes one example
+            # at a time; the vectorized Coconut path supports real eval batches.
+            if finite_state_enabled:
+                eval_batch_size = 1
+            valid_gen_dataloader = make_dataloader(
+                dataset_gen_val,
+                batch_size=eval_batch_size,
+                collator=collator,
+                sampler=valid_gen_sampler,
+                configs=configs,
             )
 
         if not configs.only_eval:
@@ -358,14 +492,18 @@ def main():
                     configs,
                     tokenizer,
                 )
-            train_dataloader = torch.utils.data.DataLoader(
+            train_sampler = DistributedSampler(
                 dataset_train,
-                num_workers=1,
-                shuffle=False,
-                pin_memory=True,
+                shuffle=True,
+                seed=configs.seed,
+            )
+            train_sampler.set_epoch(epoch)
+            train_dataloader = make_dataloader(
+                dataset_train,
                 batch_size=configs.batch_size_training,
-                collate_fn=collator,
-                sampler=DistributedSampler(dataset_train, shuffle=True),
+                collator=collator,
+                sampler=train_sampler,
+                configs=configs,
             )
 
             # the sampler is deterministic even if shuffle is set to True
@@ -390,14 +528,14 @@ def main():
                     tokenizer,
                 )
 
-            valid_loss_dataloader = torch.utils.data.DataLoader(
+            valid_loss_dataloader = make_dataloader(
                 dataset_loss_val,
-                num_workers=1,
-                shuffle=False,
-                pin_memory=True,
                 batch_size=configs.batch_size_training,
-                collate_fn=collator,
-                sampler=DistributedSampler(dataset_loss_val, shuffle=False),
+                collator=collator,
+                sampler=DistributedEvalSampler(
+                    dataset_loss_val, rank=rank, world_size=world_size
+                ),
+                configs=configs,
             )
 
             if configs.reset_optimizer and scheduled_stage < configs.max_latent_stage:
@@ -407,23 +545,31 @@ def main():
                     parallel_model.parameters(),
                     lr=configs.lr,
                     weight_decay=configs.weight_decay,
+                    fused=bool(getattr(configs, "fused_optimizer", True)),
                 )
 
             parallel_model.module.train()
+            torch.cuda.reset_peak_memory_stats(local_rank)
 
-            total_length = len(train_dataloader) // configs.gradient_accumulation_steps
+            total_length = (
+                len(train_dataloader) + configs.gradient_accumulation_steps - 1
+            ) // configs.gradient_accumulation_steps
             pbar = tqdm(
                 colour="blue",
                 desc=f"Training Epoch: {epoch+1}",
                 total=total_length,
                 dynamic_ncols=True,
+                disable=rank != 0,
             )
 
             for step, batch in enumerate(train_dataloader):
 
                 if step == 0 and wandb_run and rank == 0:
                     print("logging training data")
-                    cur_bs = len(batch["input_ids"])
+                    cur_bs = min(
+                        len(batch["input_ids"]),
+                        int(getattr(configs, "log_data_examples", 2)),
+                    )
                     text_str = ""
                     for data_idx in range(cur_bs):
                         for token_idx in range(len(batch["input_ids"][data_idx])):
@@ -449,36 +595,64 @@ def main():
                     # so we don't log it to wandb when the epoch number is set large
                 
                 total_train_steps += 1
-                batch = {
-                    key: batch[key].to(rank) for key in batch.keys() if key != "idx"
-                }
+                batch = move_batch_to_device(batch, local_rank)
 
-                outputs = parallel_model(**batch)
-
-                loss = outputs.loss / configs.gradient_accumulation_steps
-                loss.backward()
-
-                if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
-                    train_dataloader
-                ) - 1:
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    pbar.update(1)
-
-                if wandb_run and rank == 0:
-                    log_dict = {
-                        "train/epoch": epoch + 1,
-                        "train/step": epoch * len(train_dataloader) + step,
-                        "train/loss": loss.detach().float()
-                        * configs.gradient_accumulation_steps,
-                    }
-                    wandb_run.log(log_dict)
-
-                pbar.set_description(
-                    f"Training Epoch: {epoch+1}/{configs.num_epochs}, batch {step}/{len(train_dataloader)} "
-                    f"completed (loss: {round(float(loss.detach().float() * configs.gradient_accumulation_steps), 4)}"
+                should_step = (
+                    (step + 1) % configs.gradient_accumulation_steps == 0
+                    or step == len(train_dataloader) - 1
                 )
+                accumulation_group_start = (
+                    step // configs.gradient_accumulation_steps
+                ) * configs.gradient_accumulation_steps
+                accumulation_divisor = min(
+                    configs.gradient_accumulation_steps,
+                    len(train_dataloader) - accumulation_group_start,
+                )
+                sync_context = (
+                    nullcontext()
+                    if should_step
+                    else parallel_model.no_sync()
+                )
+                with sync_context:
+                    outputs = parallel_model(**batch)
+                    loss = outputs.loss / accumulation_divisor
+                    loss.backward()
+
+                if should_step:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    pbar.update(1)
+                    if rank == 0:
+                        loss_value = float(
+                            loss.detach().float() * accumulation_divisor
+                        )
+                        pbar.set_description(
+                            f"Training Epoch: {epoch+1}/{configs.num_epochs}, "
+                            f"batch {step}/{len(train_dataloader)} "
+                            f"(loss: {loss_value:.4f})"
+                        )
+                        log_every = max(
+                            1, int(getattr(configs, "log_every_steps", 10))
+                        )
+                        if wandb_run and total_train_steps % log_every == 0:
+                            wandb_run.log(
+                                {
+                                    "train/epoch": epoch + 1,
+                                    "train/step": (
+                                        epoch * len(train_dataloader) + step
+                                    ),
+                                    "train/loss": loss_value,
+                                }
+                            )
             pbar.close()
+            peak_vram = torch.tensor(
+                torch.cuda.max_memory_allocated(local_rank),
+                device=local_rank,
+                dtype=torch.float64,
+            )
+            dist.all_reduce(peak_vram, op=dist.ReduceOp.MAX)
+            if rank == 0:
+                print(f"Peak training VRAM: {peak_vram.item() / 2**30:.2f} GiB/GPU")
             dist.barrier()
 
             if (
@@ -486,7 +660,9 @@ def main():
                 and not configs.debug
                 and not configs.only_eval
             ):
-                states = parallel_model.state_dict()
+                states = state_dict_for_save(
+                    parallel_model, distributed_strategy
+                )
                 if rank == 0:
                     torch.save(
                         states, os.path.join(save_dir, f"checkpoint_{epoch + 1}")
@@ -499,28 +675,35 @@ def main():
                 torch.cuda.empty_cache()
 
             # val loss
-            total_loss = 0
+            total_loss = torch.zeros((), device=local_rank, dtype=torch.float64)
+            total_loss_examples = torch.zeros(
+                (), device=local_rank, dtype=torch.long
+            )
 
             with torch.no_grad():
                 parallel_model.module.eval()
                 for step, batch in enumerate(valid_loss_dataloader):
 
-                    batch = {
-                        key: batch[key].to(rank) for key in batch.keys() if key != "idx"
-                    }
+                    batch = move_batch_to_device(batch, local_rank)
 
                     outputs = parallel_model(**batch)
-                    loss = outputs.loss
-                    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                    total_loss += loss.item() / world_size
+                    local_batch_size = batch["input_ids"].shape[0]
+                    total_loss += outputs.loss.double() * local_batch_size
+                    total_loss_examples += local_batch_size
+
+                dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+                dist.all_reduce(total_loss_examples, op=dist.ReduceOp.SUM)
+                mean_eval_loss = (
+                    total_loss / total_loss_examples.clamp_min(1)
+                ).item()
 
                 if wandb_run and rank == 0:
 
                     log_dict = {
-                        "eval/loss": total_loss / len(valid_loss_dataloader),
+                        "eval/loss": mean_eval_loss,
                     }
                     wandb_run.log(log_dict)
-                    print("eval loss", total_loss / len(valid_loss_dataloader))
+                    print("eval loss", mean_eval_loss)
 
         # if scheduled_stage >= configs.max_latent_stage:
         if True:
@@ -528,72 +711,76 @@ def main():
             total_length = len(valid_gen_dataloader)
 
             pbar = tqdm(
-                colour="blue", desc=f"Test Accuracy", total=total_length, dynamic_ncols=True
+                colour="blue",
+                desc=f"Test Accuracy",
+                total=total_length,
+                dynamic_ncols=True,
+                disable=rank != 0,
             )
             cor, cor_cot, total = (
-                torch.tensor(0, device=rank),
-                torch.tensor(0, device=rank),
-                torch.tensor(0, device=rank),
+                torch.tensor(0, device=local_rank),
+                torch.tensor(0, device=local_rank),
+                torch.tensor(0, device=local_rank),
             )
 
             with torch.no_grad():
                 parallel_model.module.eval()
                 for idx, batch in enumerate(valid_gen_dataloader):
-                    test_idx = batch["idx"][0]
-
+                    test_indices = batch["idx"]
                     batch = {
-                        k: v.to(rank)
+                        k: v.to(local_rank, non_blocking=True)
                         for k, v in batch.items()
-                        if v != None and k not in ["idx", "position_ids"]
+                        if v is not None and k not in ["idx", "position_ids"]
                     }
                     # https://github.com/huggingface/transformers/issues/32492
 
-                    assert len(batch["input_ids"]) == 1
-                    answer = str(answers_val[test_idx.cpu().item()])
-                    # answer_cot = cot_val[test_idx.cpu().item()]
-                    # question = question_val[test_idx.cpu().item()]
-
-                    total += 1
-
-                    # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
+                    # FSDP requires the same number of generation forwards on
+                    # every rank; DDP has no such constraint.
+                    synced_generation = (
+                        distributed_strategy == "fsdp" and not configs.only_eval
+                    )
                     if configs.cot:
                         outputs = parallel_model.module.generate(
                             **batch,
                             max_new_tokens=64,
-                            synced_gpus=not configs.only_eval,
+                            synced_gpus=synced_generation,
                             eos_token_id=tokenizer.eos_token_id,
                         )
                     elif configs.no_cot:
                         outputs = parallel_model.module.generate(
                             **batch,
                             max_new_tokens=64,
-                            synced_gpus=not configs.only_eval,
+                            synced_gpus=synced_generation,
                             eos_token_id=tokenizer.eos_token_id,
                         )
                     else:
                         outputs = parallel_model.module.generate(
                             **batch,
-                        max_new_tokens=1,
-                        synced_gpus=not configs.only_eval,
-                        eos_token_id=tokenizer.eos_token_id,
-                    )
-
-                    text_output = tokenizer.decode(outputs[0], skip_special_tokens=True).replace("<eos>", "").strip()
-                    answer_output = text_output.split("[A]")[-1].replace(",", "").strip()
-                    cot_output = (
-                        ("\n".join(text_output.split("\n")[1:])).split("#")[0].strip()
-                    )
-
-                    if idx < 5 and rank == 0:
-                        # print some examples
-                        print(
-                            f"Question {test_idx}: Answer = '{answer}'"
+                            max_new_tokens=1,
+                            synced_gpus=synced_generation,
+                            eos_token_id=tokenizer.eos_token_id,
                         )
-                        print(f"Full output: '{tokenizer.decode(outputs[0])}'")
-                        print(f"Extracted Output: '{answer_output}'")
 
-                    cor += answer_output == answer
-                    # cor_cot += cot_output == answer_cot
+                    for sample_offset, test_idx in enumerate(test_indices):
+                        answer = str(answers_val[int(test_idx)])
+                        text_output = tokenizer.decode(
+                            outputs[sample_offset], skip_special_tokens=True
+                        ).replace("<eos>", "").strip()
+                        answer_output = (
+                            text_output.split("[A]")[-1]
+                            .replace(",", "")
+                            .strip()
+                        )
+                        total += 1
+                        cor += answer_output == answer
+
+                        if idx * eval_batch_size + sample_offset < 5 and rank == 0:
+                            print(f"Question {int(test_idx)}: Answer = '{answer}'")
+                            print(
+                                "Full output: "
+                                f"'{tokenizer.decode(outputs[sample_offset])}'"
+                            )
+                            print(f"Extracted Output: '{answer_output}'")
 
                     pbar.update(1)
                     pbar.set_description(
@@ -628,7 +815,9 @@ def main():
                 and not configs.debug
                 and not configs.only_eval
             ):
-                states = parallel_model.state_dict()
+                states = state_dict_for_save(
+                    parallel_model, distributed_strategy
+                )
 
                 if rank == 0:
                     torch.save(states, os.path.join(save_dir, f"checkpoint_{epoch + 1}"))
@@ -640,6 +829,10 @@ def main():
                 del states
                 gc.collect()
                 torch.cuda.empty_cache()
+
+    if wandb_run:
+        wandb_run.finish()
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

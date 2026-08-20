@@ -105,12 +105,62 @@ with `d`, model bits (`mb`), and the training dtype. Generated configs and a
 JSONL manifest are written under `results/prosqa_grid/`. Existing checkpoints
 are resumed by `run.py`.
 
+Grid names are generated from every varied field, not just the original two.
+For example:
+
+```yaml
+grid:
+  state_dim: [32, 64]
+  model_bits: [4, 8]
+  batch_size_training: [256, 512]
+  training_dtype: [bfloat16]
+```
+
+This produces names such as
+`prosqa-finite-state-readonly-qat-d32-mb4-bs256-dtypebfloat16` and saves its
+checkpoints under
+`ckpts/prosqa-finite-state-readonly-qat-d32-mb4-bs256-dtypebfloat16/`.
+Dotted nested keys such as `finite_state.access_mode` are also supported. Each
+manifest entry includes the exact `grid_values`, generated config path,
+`checkpoint_dir`, and launch command.
+
 ## Verification
 
 ```bash
 python -m unittest discover -s tests -v
 python experiments/run_mechanism_checks.py
 ```
+
+## Two-B200 high-throughput training
+
+Use the BF16/DDP preset for the original Coconut model:
+
+```bash
+cd /workspace/LCoT
+CUDA_VISIBLE_DEVICES=0,1 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun --standalone --nnodes=1 --nproc_per_node=2 \
+  run.py args/prosqa_coconut_2xb200.yaml
+```
+
+The preset starts at `batch_size_training: 1024` per GPU (global batch 2048),
+uses BF16, fused AdamW, SDPA, tensor-core-friendly padding, pinned asynchronous
+copies, batched validation, and DDP. For this two-layer model, DDP is faster than
+FSDP and easily fits in B200 memory. Raise the per-GPU batch until peak allocated
+VRAM is around 85--90%; lower it if using a materially larger pretrained model.
+Set `distributed_strategy: fsdp` only when the model itself no longer fits
+comfortably on one GPU. Gradient checkpointing is available for the base and
+strict finite-state paths, but not for original Coconut because its recurrent
+training pass depends on a live KV cache.
+
+Blackwell requires a PyTorch wheel built with CUDA 12.8 or newer. Verify before
+launching:
+
+```bash
+python -c 'import torch; print(torch.__version__, torch.version.cuda); print([torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())])'
+```
+
+The CUDA backend should report 12.8 or newer and both devices should be visible.
 
 The tests verify finite alphabets and hard codes, prefix sealing, one-query
 oracle enforcement, Boolean BFS, pointer capacity/depth controls, hypercube

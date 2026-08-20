@@ -4,6 +4,16 @@
 import json
 import itertools
 import random
+
+
+def _distributed_data_parallel_enabled():
+    """Whether this process participates in an initialized multi-rank job.
+
+    CUDA device count is not a valid proxy here: grid workers intentionally see
+    one GPU each, while a standalone process may still see several GPUs.
+    """
+
+    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
 from dataclasses import dataclass
 from typing import Optional
 
@@ -21,6 +31,7 @@ class MyCollator:
     tokenizer: PreTrainedTokenizerBase
     latent_id: Optional[int] = None
     label_pad_token_id: Optional[int] = -100
+    pad_to_multiple_of: Optional[int] = None
 
     def __call__(self, features, return_tensors=None):
 
@@ -84,7 +95,7 @@ class MyCollator:
             self.tokenizer,
             non_label_position_features,
             padding=True,
-            pad_to_multiple_of=None,
+            pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors=return_tensors,
         )
 
@@ -103,7 +114,7 @@ class MyCollator:
         # we have to pad the labels and position_ids manually as we cannot rely on `tokenizer.pad`
 
         if labels is not None:
-            max_label_length = max(len(l) for l in labels)
+            max_label_length = batch["input_ids"].shape[1]
 
             batch["labels"] = [
                 label + [self.label_pad_token_id] * (max_label_length - len(label))
@@ -112,7 +123,7 @@ class MyCollator:
             batch["labels"] = torch.tensor(batch["labels"], dtype=torch.int64)
 
         if position_ids is not None:
-            max_pos_length = max(len(l) for l in position_ids)
+            max_pos_length = batch["input_ids"].shape[1]
 
             batch["position_ids"] = [
                 position_id + [0] * (max_pos_length - len(position_id))
@@ -242,7 +253,7 @@ def get_graph_latent_cot_dataset(
             
         return processed_samples
 
-    if torch.cuda.device_count() > 1:
+    if _distributed_data_parallel_enabled():
         if dist.get_rank() == 0:
             # Process each sample and collect all results
             all_processed_samples = []
@@ -295,7 +306,7 @@ def get_graph_latent_question_dataset(
             })
         return processed_samples
     
-    if torch.cuda.device_count() > 1:
+    if _distributed_data_parallel_enabled():
         if dist.get_rank() == 0:
             # Process each sample and collect all results
             all_processed_samples = []
@@ -378,7 +389,7 @@ def get_graph_cot_dataset(
             
         return [processed_sample]
 
-    if torch.cuda.device_count() > 1:
+    if _distributed_data_parallel_enabled():
         if dist.get_rank() == 0:
             # Process each sample and collect all results
             all_processed_samples = []
@@ -454,7 +465,7 @@ def get_graph_no_cot_dataset(
             
         return [processed_sample]
 
-    if torch.cuda.device_count() > 1:
+    if _distributed_data_parallel_enabled():
         if dist.get_rank() == 0:
             # Process each sample and collect all results
             all_processed_samples = []
@@ -519,7 +530,7 @@ def get_graph_no_latent_question_dataset(
         }
         return [processed_sample]
     
-    if torch.cuda.device_count() > 1:
+    if _distributed_data_parallel_enabled():
         if dist.get_rank() == 0:
             # Process each sample and collect all results
             all_processed_samples = []
