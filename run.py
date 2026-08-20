@@ -6,8 +6,19 @@ import torch.distributed
 import torch.optim as optim
 from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 
+import os, sys
+
+# This training harness must never attempt an online W&B sync. Keep local
+# offline logging when the package is installed, and allow training to run
+# without W&B installed at all.
+os.environ["WANDB_MODE"] = "offline"
+os.environ.setdefault("WANDB_SILENT", "true")
+
 from stokenizer import STokenizer
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import (
@@ -33,7 +44,6 @@ from dataset import (
 )
 
 from tqdm import tqdm
-import os, sys
 import yaml
 import json
 import gc
@@ -412,13 +422,24 @@ def main():
 
     total_train_steps = 0
 
-    if not configs.debug and not configs.only_eval and rank == 0:
-        wandb_run = wandb.init(project=configs.project, name=configs.name)
+    if (
+        not configs.debug
+        and not configs.only_eval
+        and rank == 0
+        and wandb is not None
+    ):
+        wandb_run = wandb.init(
+            project=configs.project,
+            name=configs.name,
+            mode="offline",
+        )
         wandb_run.config.update(configs, allow_val_change=True)
         text_table = wandb.Table(columns=["step", "text"])
 
     else:
         wandb_run = None
+        if not configs.debug and not configs.only_eval and rank == 0:
+            print("W&B is unavailable; continuing without W&B logging.")
 
 
     optimizer = optim.AdamW(
