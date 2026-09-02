@@ -30,6 +30,22 @@ def tiny_gpt2():
     )
 
 
+def tiny_qwen3():
+    return Qwen3ForCausalLM(
+        Qwen3Config(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=32,
+            use_sliding_window=False,
+        )
+    )
+
+
 def finite_config():
     return {
         "state_dim": 4,
@@ -82,20 +98,7 @@ class RunLoraTests(unittest.TestCase):
         self.assertTrue(all(not parameter.requires_grad for parameter in frozen_base))
 
     def test_qwen3_lora_targets_attention_and_mlp_projections(self):
-        model = Qwen3ForCausalLM(
-            Qwen3Config(
-                vocab_size=64,
-                hidden_size=32,
-                intermediate_size=64,
-                num_hidden_layers=1,
-                num_attention_heads=4,
-                num_key_value_heads=2,
-                head_dim=8,
-                max_position_embeddings=32,
-                use_sliding_window=False,
-            )
-        )
-        model = add_pretrained_lora(model)
+        model = add_pretrained_lora(tiny_qwen3())
         self.assertEqual(
             model.peft_config["default"].target_modules,
             {
@@ -137,6 +140,88 @@ class RunLoraTests(unittest.TestCase):
         self.assertTrue(all(code.shape == (1, 4) for code in codes))
         self.assertEqual(tail_start, 5)
         self.assertEqual(state_position, 3)
+
+    def test_finite_state_forward_batches_examples_by_recurrent_depth(self):
+        model = StrictFiniteStateCoconut(
+            tiny_gpt2(), 33, 31, 32, 38, finite_config()
+        )
+        model.eval()
+        input_ids = torch.tensor(
+            [
+                [38, 35, 1, 31, 33, 33, 32, 37, 38],
+                [35, 2, 31, 33, 32, 36, 37, 38, 38],
+                [38, 38, 35, 3, 4, 5, 6, 36, 37],
+            ]
+        )
+        attention_mask = torch.tensor(
+            [
+                [0, 1, 1, 1, 1, 1, 1, 1, 0],
+                [1, 1, 1, 1, 1, 1, 1, 0, 0],
+                [0, 0, 1, 1, 1, 1, 1, 1, 1],
+            ]
+        )
+        labels = torch.full_like(input_ids, -100)
+        labels[0, 7] = 37
+        labels[1, 6] = 37
+        labels[2, 8] = 37
+
+        expected_losses = []
+        with torch.no_grad():
+            for index in range(input_ids.shape[0]):
+                ids, kept_labels = model._trim_example(
+                    input_ids[index], attention_mask[index], labels[index]
+                )
+                loss, _, _, _ = model._example_forward(
+                    ids, kept_labels
+                )
+                expected_losses.append(loss)
+
+        calls = []
+        hook = model.base_causallm.register_forward_hook(
+            lambda *unused: calls.append(1)
+        )
+        try:
+            with torch.no_grad():
+                output = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
+        finally:
+            hook.remove()
+
+        torch.testing.assert_close(output.loss, torch.stack(expected_losses).mean())
+        # Two latent depths plus one final prediction pass, independent of the
+        # number of examples in the batch.
+        self.assertEqual(len(calls), 3)
+
+    def test_batched_finite_state_forward_preserves_gradients(self):
+        model = StrictFiniteStateCoconut(
+            add_pretrained_lora(tiny_qwen3()), 33, 31, 32, 38, finite_config()
+        )
+        input_ids = torch.tensor(
+            [
+                [35, 1, 31, 33, 33, 32, 37],
+                [35, 2, 31, 33, 32, 36, 37],
+            ]
+        )
+        labels = torch.full_like(input_ids, -100)
+        labels[:, -1] = 37
+        output = model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            labels=labels,
+        )
+        output.loss.backward()
+
+        self.assertIsNotNone(model.bottleneck.down.weight.grad)
+        self.assertTrue(
+            any(
+                parameter.grad is not None
+                for name, parameter in model.named_parameters()
+                if "lora_" in name
+            )
+        )
 
     def test_lora_checkpoint_round_trip(self):
         source = StrictFiniteStateCoconut(

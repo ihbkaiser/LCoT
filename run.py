@@ -177,6 +177,19 @@ def checkpoint_path(save_dir, epoch, *, save_best_only=False):
     return os.path.join(save_dir, filename)
 
 
+def unwrap_parallel_model(model):
+    """Return the underlying model for plain, DDP, and FSDP execution."""
+
+    return model.module if hasattr(model, "module") else model
+
+
+def checkpoint_state_dict(model, *, uses_fsdp):
+    """Use FSDP's state-dict hooks only when the model is actually sharded."""
+
+    state_model = model if uses_fsdp else unwrap_parallel_model(model)
+    return state_model, state_model.state_dict()
+
+
 def main():
     parser = argparse.ArgumentParser(description="coconut")
     parser.add_argument("config_file")
@@ -382,7 +395,6 @@ def main():
             f"({100 * trainable / total:.4f}%)"
         )
 
-    print(f"Running FSDP on rank = {rank}, world size = {world_size}")
     model = model.to(rank)
 
     llama_auto_wrap_policy = functools.partial(
@@ -408,11 +420,16 @@ def main():
         )
     model.to(dtype_map[training_dtype])
 
-    # if only eval, use ddp (to avoid bugs in fsdp)
-    if configs.only_eval:
+    uses_fsdp = world_size > 1 and not configs.only_eval
+    if world_size == 1:
+        parallel_model = model
+        if rank == 0:
+            print("Running plain PyTorch on one GPU (no DDP/FSDP)")
+    elif configs.only_eval:
         parallel_model = DDP(model, device_ids=[rank])
-
     else:
+        if rank == 0:
+            print(f"Running FSDP with world size {world_size}")
         parallel_model = FSDP(
             model,
             auto_wrap_policy=llama_auto_wrap_policy,
@@ -568,7 +585,7 @@ def main():
                     weight_decay=configs.weight_decay,
                 )
 
-            parallel_model.module.train()
+            unwrap_parallel_model(parallel_model).train()
 
             total_length = len(train_dataloader) // configs.gradient_accumulation_steps
             pbar = tqdm(
@@ -646,9 +663,11 @@ def main():
                 and not configs.debug
                 and not configs.only_eval
             ):
-                states = parallel_model.state_dict()
+                state_model, states = checkpoint_state_dict(
+                    parallel_model, uses_fsdp=uses_fsdp
+                )
                 if uses_lora:
-                    states = trainable_state_dict(parallel_model, states)
+                    states = trainable_state_dict(state_model, states)
                 if rank == 0:
                     torch.save(
                         states,
@@ -665,7 +684,7 @@ def main():
             total_loss = 0
 
             with torch.no_grad():
-                parallel_model.module.eval()
+                unwrap_parallel_model(parallel_model).eval()
                 for step, batch in enumerate(valid_loss_dataloader):
 
                     batch = {
@@ -700,7 +719,7 @@ def main():
             )
 
             with torch.no_grad():
-                parallel_model.module.eval()
+                unwrap_parallel_model(parallel_model).eval()
                 for idx, batch in enumerate(valid_gen_dataloader):
                     test_idx = batch["idx"][0]
 
@@ -720,24 +739,24 @@ def main():
 
                     # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
                     if configs.cot:
-                        outputs = parallel_model.module.generate(
+                        outputs = unwrap_parallel_model(parallel_model).generate(
                             **batch,
                             max_new_tokens=64,
-                            synced_gpus=not configs.only_eval,
+                            synced_gpus=world_size > 1 and not configs.only_eval,
                             eos_token_id=tokenizer.eos_token_id,
                         )
                     elif configs.no_cot:
-                        outputs = parallel_model.module.generate(
+                        outputs = unwrap_parallel_model(parallel_model).generate(
                             **batch,
                             max_new_tokens=64,
-                            synced_gpus=not configs.only_eval,
+                            synced_gpus=world_size > 1 and not configs.only_eval,
                             eos_token_id=tokenizer.eos_token_id,
                         )
                     else:
-                        outputs = parallel_model.module.generate(
+                        outputs = unwrap_parallel_model(parallel_model).generate(
                             **batch,
                         max_new_tokens=1,
-                        synced_gpus=not configs.only_eval,
+                        synced_gpus=world_size > 1 and not configs.only_eval,
                         eos_token_id=tokenizer.eos_token_id,
                     )
 
@@ -791,9 +810,11 @@ def main():
                 and not configs.debug
                 and not configs.only_eval
             ):
-                states = parallel_model.state_dict()
+                state_model, states = checkpoint_state_dict(
+                    parallel_model, uses_fsdp=uses_fsdp
+                )
                 if uses_lora:
-                    states = trainable_state_dict(parallel_model, states)
+                    states = trainable_state_dict(state_model, states)
 
                 if rank == 0:
                     output_path = checkpoint_path(

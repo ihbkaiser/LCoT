@@ -74,6 +74,11 @@ class StrictFiniteStateCoconut(nn.Module):
 
     def _base(self, embeds: Tensor, *, hidden: bool = False):
         self.gen_forward_cnt += 1
+        kwargs = {}
+        if hidden and getattr(self.base_causallm.config, "model_type", None) == "qwen3":
+            # State updates only consume the final hidden state. Avoid projecting
+            # every prefix position over Qwen's full vocabulary.
+            kwargs["logits_to_keep"] = 1
         return self.base_causallm(
             inputs_embeds=embeds,
             attention_mask=torch.ones(
@@ -81,7 +86,33 @@ class StrictFiniteStateCoconut(nn.Module):
             ),
             use_cache=False,
             output_hidden_states=hidden,
+            **kwargs,
         )
+
+    def _batched_last_hidden(self, sequences: List[Tensor]) -> Tensor:
+        """Run one padded LM batch and select each sequence's last hidden state."""
+
+        lengths = torch.tensor(
+            [sequence.shape[0] for sequence in sequences],
+            device=sequences[0].device,
+            dtype=torch.long,
+        )
+        padded = pad_sequence(sequences, batch_first=True)
+        positions = torch.arange(padded.shape[1], device=padded.device)
+        attention_mask = positions.unsqueeze(0) < lengths.unsqueeze(1)
+        self.gen_forward_cnt += 1
+        kwargs = {}
+        if getattr(self.base_causallm.config, "model_type", None) == "qwen3":
+            kwargs["logits_to_keep"] = 1
+        outputs = self.base_causallm(
+            inputs_embeds=padded,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=True,
+            **kwargs,
+        )
+        batch_indices = torch.arange(len(sequences), device=padded.device)
+        return outputs.hidden_states[-1][batch_indices, lengths - 1]
 
     def _trim_example(
         self, input_ids: Tensor, attention_mask: Tensor, labels: Tensor | None
@@ -175,28 +206,168 @@ class StrictFiniteStateCoconut(nn.Module):
     def forward(
         self, input_ids, attention_mask, labels, position_ids=None, **kwargs
     ) -> Outputs:
-        losses = []
-        embeds = []
-        logits = []
-        all_codes: List[List[Tensor]] = []
+        trimmed_ids = []
+        trimmed_labels = []
+        prefixes: List[Tensor | None] = []
+        tails: List[Tensor | None] = []
+        valid_mask = attention_mask.to(torch.bool)
+        latent_mask = input_ids.eq(self.latent_token_id) & valid_mask
+        token_positions = torch.arange(
+            input_ids.shape[1], device=input_ids.device
+        ).unsqueeze(0)
+        latent_counts_tensor = latent_mask.sum(dim=1)
+        first_physical = torch.where(
+            latent_mask, token_positions, input_ids.shape[1]
+        ).amin(dim=1)
+        last_physical = torch.where(latent_mask, token_positions, -1).amax(dim=1)
+        valid_start = valid_mask.to(torch.long).argmax(dim=1)
+        latent_metadata = torch.stack(
+            (
+                latent_counts_tensor,
+                first_physical - valid_start,
+                last_physical - valid_start,
+            ),
+            dim=1,
+        ).tolist()
+        latent_counts = [metadata[0] for metadata in latent_metadata]
+        all_codes: List[List[Tensor]] = [[] for _ in range(input_ids.shape[0])]
+
         for index in range(input_ids.shape[0]):
             ids, kept_labels = self._trim_example(
-                input_ids[index], attention_mask[index], labels[index]
+                input_ids[index],
+                attention_mask[index],
+                labels[index] if labels is not None else None,
             )
-            loss, example_embeds, example_logits, codes = self._example_forward(
-                ids, kept_labels
+            trimmed_ids.append(ids)
+            trimmed_labels.append(kept_labels)
+            latent_count, first, last = latent_metadata[index]
+            if latent_count:
+                if first == 0:
+                    raise ValueError(
+                        "a finite-state sequence must have a non-empty prefix"
+                    )
+                prefixes.append(self.embedding(ids[:first]))
+                tails.append(self.embedding(ids[last + 1 :]))
+            else:
+                prefixes.append(None)
+                tails.append(None)
+
+        states: List[Tensor | None] = [None] * input_ids.shape[0]
+        active = [index for index, count in enumerate(latent_counts) if count]
+        if active:
+            initial_hidden = self._batched_last_hidden(
+                [prefixes[index] for index in active]
             )
-            losses.append(loss)
-            embeds.append(example_embeds)
-            logits.append(example_logits)
-            all_codes.append(codes)
-        self.last_state_codes = [
-            [code.detach().cpu() for code in trace] for trace in all_codes
+            initial_state = self.bottleneck.compress(initial_hidden)
+            for row, index in enumerate(active):
+                states[index] = initial_state.value[row]
+                all_codes[index].append(initial_state.codes[row])
+
+        for update_index in range(1, max(latent_counts, default=0)):
+            active = [
+                index
+                for index, count in enumerate(latent_counts)
+                if count > update_index
+            ]
+            if self.access_mode == "readonly_input":
+                update_hidden = self._batched_last_hidden(
+                    [
+                        torch.cat(
+                            (
+                                prefixes[index],
+                                self.bottleneck.expand(states[index]).unsqueeze(0),
+                            ),
+                            dim=0,
+                        )
+                        for index in active
+                    ]
+                )
+                updated_state = self.bottleneck.compress(update_hidden)
+            else:
+                current_states = torch.stack([states[index] for index in active])
+                updated_state = self.bottleneck.quantizer.quantize(
+                    self.sealed_transition(current_states)
+                )
+            for row, index in enumerate(active):
+                states[index] = updated_state.value[row]
+                all_codes[index].append(updated_state.codes[row])
+
+        effective_sequences = []
+        state_positions = []
+        tail_starts = []
+        for index, ids in enumerate(trimmed_ids):
+            if latent_counts[index]:
+                state_embed = self.bottleneck.expand(states[index]).unsqueeze(0)
+                effective_sequences.append(
+                    torch.cat((prefixes[index], state_embed, tails[index]), dim=0)
+                )
+                state_positions.append(prefixes[index].shape[0])
+                tail_starts.append(latent_metadata[index][2] + 1)
+            else:
+                effective_sequences.append(self.embedding(ids))
+                state_positions.append(0)
+                tail_starts.append(-1)
+
+        effective_lengths = [
+            sequence.shape[0] for sequence in effective_sequences
         ]
+        lengths = torch.tensor(
+            effective_lengths,
+            device=input_ids.device,
+            dtype=torch.long,
+        )
+        effective = pad_sequence(effective_sequences, batch_first=True)
+        positions = torch.arange(effective.shape[1], device=input_ids.device)
+        effective_mask = positions.unsqueeze(0) < lengths.unsqueeze(1)
+        self.gen_forward_cnt += 1
+        outputs = self.base_causallm(
+            inputs_embeds=effective,
+            attention_mask=effective_mask,
+            use_cache=False,
+        )
+
+        losses = []
+        for index, kept_labels in enumerate(trimmed_labels):
+            example_logits = outputs.logits[index, : effective_lengths[index]]
+            if kept_labels is None:
+                loss = example_logits.sum() * 0.0
+            elif tail_starts[index] < 0:
+                loss = F.cross_entropy(
+                    example_logits[:-1], kept_labels[1:], ignore_index=-100
+                )
+            else:
+                tail_labels = kept_labels[tail_starts[index] :]
+                prediction_logits = example_logits[
+                    state_positions[index] : state_positions[index]
+                    + tail_labels.numel()
+                ]
+                supervised = tail_labels != -100
+                loss = (
+                    F.cross_entropy(
+                        prediction_logits[supervised], tail_labels[supervised]
+                    )
+                    if supervised.any()
+                    else example_logits.sum() * 0.0
+                )
+            losses.append(loss)
+
+        self.last_state_codes = [
+            [code.detach() for code in trace] for trace in all_codes
+        ]
+        max_latents = max(latent_counts, default=0)
+        self.last_ledger = ResourceLedger(
+            state_dim=self.bottleneck.state_dim,
+            bits_per_coordinate=self.bottleneck.bits,
+            recurrent_updates=max(0, max_latents - 1),
+            access_model=self.access_mode,
+            input_reads=max_latents + 1 if max_latents else 1,
+            retains_latent_history=False,
+            notes="batched by recurrent depth; no past_key_values",
+        )
         return Outputs(
             loss=torch.stack(losses).mean(),
-            inputs_embeds=pad_sequence(embeds, batch_first=True),
-            logits=pad_sequence(logits, batch_first=True),
+            inputs_embeds=effective,
+            logits=outputs.logits,
         )
 
     @torch.no_grad()
@@ -236,4 +407,7 @@ class StrictFiniteStateCoconut(nn.Module):
         return (tokens, effective) if output_embedding else tokens
 
     def export_state_codes(self):
-        return [[code.tolist() for code in trace] for trace in self.last_state_codes]
+        return [
+            [code.detach().cpu().tolist() for code in trace]
+            for trace in self.last_state_codes
+        ]
