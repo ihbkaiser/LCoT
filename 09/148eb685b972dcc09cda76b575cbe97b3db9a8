@@ -1,0 +1,35 @@
+tests/test_run_lora.py
+  s_141d6e2480a12e::t_24d3fbc579bbef 4,70-97
+  s_141d6e2480a12e::t_3fe4ce56c5ee60 1-3,5-40,46-69,98-117,128-143,154-166
+  s_141d6e2480a12e::t_79108ae7166c09 41-45,144-153
+  s_141d6e2480a12e::t_12181349cd038d 118-127
+args/prosqa_finite_state_2l_8h_768d.yaml
+  s_141d6e2480a12e::t_12181349cd038d 32-33
+requirements.txt
+  s_141d6e2480a12e::t_24d3fbc579bbef 3-4
+run.py
+  s_141d6e2480a12e::t_24d3fbc579bbef 20,49-63,74-75,344-345
+  s_141d6e2480a12e::t_ec68b753029338 72-73
+  s_141d6e2480a12e::t_3fe4ce56c5ee60 7,42-48,64-71,76-134,140-141,143,247-248,280-284,320-335,369-374,514-518
+  s_141d6e2480a12e::t_79108ae7166c09 403-407
+  s_141d6e2480a12e::t_961ccd8e4a054e 135-139,142
+README.md
+  s_141d6e2480a12e::t_24d3fbc579bbef 104-170
+  s_141d6e2480a12e::t_3fe4ce56c5ee60 84-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "09148eb685b972dcc09cda76b575cbe97b3db9a8",
+  "prompts": {},
+  "sessions": {
+    "s_141d6e2480a12e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a04908-b3c9-7791-b344-4443fb14ee68",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "hung20gg <quanghung20gg@gmail.com>"
+    }
+  }
+}
