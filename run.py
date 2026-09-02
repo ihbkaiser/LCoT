@@ -141,9 +141,53 @@ def trainable_parameter_counts(model):
     return trainable, total
 
 
+def trainable_state_dict(model, state_dict=None):
+    """Return only parameters that are updated during training.
+
+    Tied embedding aliases are intentionally deduplicated: loading any one of
+    their state-dict entries updates the shared input/output parameter. FSDP's
+    internal wrapper component is normalized because it may be present in
+    parameter names while omitted from state-dict keys.
+    """
+
+    def canonical_name(name):
+        return name.replace("_fsdp_wrapped_module.", "")
+
+    trainable_names = {
+        canonical_name(name)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    if state_dict is None:
+        state_dict = model.state_dict()
+    selected = {
+        name: value
+        for name, value in state_dict.items()
+        if canonical_name(name) in trainable_names
+    }
+    if not selected:
+        raise ValueError("No trainable parameters were found for the checkpoint")
+    return selected
+
+
+def checkpoint_path(save_dir, epoch, *, save_best_only=False):
+    """Return the output path for an epoch or single-best checkpoint."""
+
+    filename = "best_model.pt" if save_best_only else f"checkpoint_{epoch}"
+    return os.path.join(save_dir, filename)
+
+
 def main():
     parser = argparse.ArgumentParser(description="coconut")
     parser.add_argument("config_file")
+    parser.add_argument(
+        "--save-best-only",
+        action="store_true",
+        help=(
+            "save only the weights with the highest validation accuracy, "
+            "overwriting best_model.pt"
+        ),
+    )
     args = parser.parse_args()
     # init distributed environment
     dist.init_process_group("nccl")
@@ -155,11 +199,15 @@ def main():
     # load the configuration file
     with open(args.config_file) as f:
         config_dict = yaml.safe_load(f)
+    if args.save_best_only:
+        config_dict["save_best_only"] = True
 
     if rank == 0:
         print("Config:", config_dict)
 
     configs = Config(config_dict)
+    configs.save_best_only = getattr(configs, "save_best_only", False)
+    configs.save_only_improve = getattr(configs, "save_only_improve", False)
     set_seed(configs.seed)
     save_dir = os.path.join(configs.save_path, configs.name)
 
@@ -409,7 +457,7 @@ def main():
         weight_decay=configs.weight_decay,
     )
 
-    best_acc = 0
+    best_acc = float("-inf")
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
 
@@ -594,13 +642,17 @@ def main():
 
             if (
                 not configs.save_only_improve
+                and not configs.save_best_only
                 and not configs.debug
                 and not configs.only_eval
             ):
                 states = parallel_model.state_dict()
+                if uses_lora:
+                    states = trainable_state_dict(parallel_model, states)
                 if rank == 0:
                     torch.save(
-                        states, os.path.join(save_dir, f"checkpoint_{epoch + 1}")
+                        states,
+                        checkpoint_path(save_dir, epoch + 1),
                     )
                     print("saving model.")
 
@@ -735,15 +787,22 @@ def main():
             dist.barrier()
             if (
                 cor / total > best_acc
-                and configs.save_only_improve
+                and (configs.save_only_improve or configs.save_best_only)
                 and not configs.debug
                 and not configs.only_eval
             ):
                 states = parallel_model.state_dict()
+                if uses_lora:
+                    states = trainable_state_dict(parallel_model, states)
 
                 if rank == 0:
-                    torch.save(states, os.path.join(save_dir, f"checkpoint_{epoch + 1}"))
-                    print("saving model.")
+                    output_path = checkpoint_path(
+                        save_dir,
+                        epoch + 1,
+                        save_best_only=configs.save_best_only,
+                    )
+                    torch.save(states, output_path)
+                    print(f"saving model to {output_path}.")
 
                 best_acc = cor / total
 

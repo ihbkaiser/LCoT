@@ -1,3 +1,4 @@
+import os
 import unittest
 
 import torch
@@ -7,7 +8,9 @@ from finite_cot.rbs_adapter import StrictFiniteStateCoconut
 from run import (
     LORA_RANK,
     add_pretrained_lora,
+    checkpoint_path,
     load_training_checkpoint,
+    trainable_state_dict,
 )
 
 
@@ -38,6 +41,16 @@ def finite_config():
 
 
 class RunLoraTests(unittest.TestCase):
+    def test_best_only_checkpoint_uses_stable_path(self):
+        self.assertEqual(
+            checkpoint_path("ckpts/run", 7, save_best_only=True),
+            os.path.join("ckpts/run", "best_model.pt"),
+        )
+        self.assertEqual(
+            checkpoint_path("ckpts/run", 7),
+            os.path.join("ckpts/run", "checkpoint_7"),
+        )
+
     def test_random_base_remains_fully_trainable_without_lora(self):
         model = tiny_gpt2()
         self.assertFalse(any("lora_" in name for name, _ in model.named_parameters()))
@@ -151,6 +164,42 @@ class RunLoraTests(unittest.TestCase):
         self.assertEqual(len(source_codes), len(target_codes))
         for source_code, target_code in zip(source_codes, target_codes):
             self.assertTrue(torch.equal(source_code, target_code))
+
+    def test_trainable_checkpoint_excludes_frozen_base_weights(self):
+        source = StrictFiniteStateCoconut(
+            add_pretrained_lora(tiny_gpt2()), 33, 31, 32, 38, finite_config()
+        )
+        checkpoint = trainable_state_dict(source)
+
+        self.assertTrue(any("lora_" in key for key in checkpoint))
+        self.assertTrue(
+            any(
+                marker in key
+                for key in checkpoint
+                for marker in ("embedding", "embed_tokens", "wte", "lm_head")
+            )
+        )
+        self.assertTrue(any("bottleneck" in key for key in checkpoint))
+        self.assertFalse(
+            any(
+                "base_layer.weight" in key and "embedding" not in key
+                for key in checkpoint
+            )
+        )
+        full_state = source.state_dict()
+        self.assertLess(
+            sum(value.numel() for value in checkpoint.values()),
+            sum(value.numel() for value in full_state.values()),
+        )
+
+        target = StrictFiniteStateCoconut(
+            add_pretrained_lora(tiny_gpt2()), 33, 31, 32, 38, finite_config()
+        )
+        load_training_checkpoint(
+            target, checkpoint, coconut=True, uses_lora=True
+        )
+        for key, value in checkpoint.items():
+            self.assertTrue(torch.equal(value, target.state_dict()[key]), key)
 
     def test_pre_lora_checkpoint_is_rejected(self):
         model = StrictFiniteStateCoconut(

@@ -135,6 +135,7 @@ finite_state:
   access_mode: readonly_input
 
 save_only_improve: true
+save_best_only: true
 uniform_prob: 0.1
 model_id: configs/symbol-2layer-8head-768dim.json # bypassed for pretrained runs
 pretrained_model_id: Qwen/Qwen3-0.6B
@@ -156,16 +157,23 @@ lr: 1.0e-4
 weight_decay: 0.01
 ```
 
-Launch on two GPUs from the repository root:
+Launch on one GPU from the repository root:
 
 ```bash
 python -m pip install -r requirements.txt
-torchrun --standalone --nnodes=1 --nproc_per_node=2 run.py \
+torchrun --standalone --nnodes=1 --nproc_per_node=1 run.py \
   args/prosqa_finite_state_qwen3_0.6b.yaml
 ```
 
-The effective global batch size is `2 GPUs * 2 examples * 64 accumulation =
-256`. Reduce `batch_size_training` if memory is tight and increase
+With `save_best_only: true`, each validation-accuracy improvement overwrites
+`ckpts/prosqa-qwen3-0.6b-finite-state-d64-p2-readonly/best_model.pt`, so the run
+retains one model-weight file. For LoRA runs, that file contains only trainable
+weights: the LoRA adapters, token embeddings/LM head, and finite-state modules;
+the frozen Qwen base is not duplicated. The same best-only behavior can be
+enabled for any config with the `--save-best-only` command-line flag.
+
+The effective global batch size is `1 GPU * 2 examples * 64 accumulation =
+128`. Reduce `batch_size_training` if memory is tight and increase
 `gradient_accumulation_steps` proportionally to retain that effective batch.
 
 ### ProsQA QAT grid search
