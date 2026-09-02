@@ -81,12 +81,92 @@ adding the finite-state CCoT bottleneck. This bypasses `model_id`, resizes the
 language-model vocabulary to `STokenizer`, and writes the resolved Hugging Face
 configuration to `<save_path>/<name>/model_config.json`. Set it to `null` to
 construct random weights from the local `model_id` configuration instead.
+Pretrained models are adapted with rank-4 LoRA: the original transformer is
+frozen, while LoRA weights, the resized token input/output interface, and the
+finite-state bottleneck remain trainable. Resumed pretrained runs must use a
+checkpoint created with this LoRA topology; older full-finetuning checkpoints
+are rejected with a compatibility error.
+
+Both vocabulary and latent inputs preserve the transformer's hidden width.
+Vocabulary IDs map directly to vectors of width `H`; a latent hidden vector is
+projected from `H` to the finite state width `d`, hard-quantized, and expanded
+from `d` back to `H`. The expanded vector occupies one sequence position next
+to vocabulary embeddings. Its width is continuous, but its retained
+information is still limited to the discrete `d * model_bits` code because the
+expansion is a deterministic function of that code.
 
 Set `tokenizer: stokenizer` to use the built-in symbolic tokenizer. Any other
 value is treated as a Hugging Face tokenizer ID. The trainer then registers
 `<|start-latent|>`, `<|end-latent|>`, and `<|latent|>` as additional special
 tokens, configures right padding, resizes the model embeddings, and saves the
 resolved tokenizer under `<save_path>/<name>/tokenizer/`.
+
+### Qwen3-0.6B LoRA run
+
+Install the pinned dependencies from `requirements.txt`, then save the
+following as `args/prosqa_finite_state_qwen3_0.6b.yaml`. Qwen3 requires
+Transformers 4.51 or newer; the requirements file pins a compatible release.
+The native [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B)
+tokenizer is retained and the three latent markers are added automatically.
+
+```yaml
+project: finite-cot
+save_path: ckpts
+name: prosqa-qwen3-0.6b-finite-state-d64-p2-readonly
+
+only_eval: false
+coconut: true
+cot: false
+no_thoughts: false
+no_cot: false
+
+c_thought: 1
+epochs_per_stage: 25
+max_latent_stage: 4
+pad_latent_to_max: true
+
+finite_state:
+  enabled: true
+  state_dim: 64
+  model_bits: 2
+  bits_per_coordinate: 2
+  clip_value: 1.0
+  learnable_clip: false
+  access_mode: readonly_input
+
+save_only_improve: true
+uniform_prob: 0.1
+model_id: configs/symbol-2layer-8head-768dim.json # bypassed for pretrained runs
+pretrained_model_id: Qwen/Qwen3-0.6B
+tokenizer: Qwen/Qwen3-0.6B
+load_model_path: None
+
+seed: 17
+resume: 0
+bf16: true
+training_dtype: bfloat16
+train_path: data/prosqa_train_graph_4_coconut.json
+val_path: data/prosqa_valid_graph_4_coconut.json
+reset_optimizer: false
+batch_size_training: 2
+debug: false
+gradient_accumulation_steps: 64
+num_epochs: 300
+lr: 1.0e-4
+weight_decay: 0.01
+```
+
+Launch on two GPUs from the repository root:
+
+```bash
+python -m pip install -r requirements.txt
+torchrun --standalone --nnodes=1 --nproc_per_node=2 run.py \
+  args/prosqa_finite_state_qwen3_0.6b.yaml
+```
+
+The effective global batch size is `2 GPUs * 2 examples * 64 accumulation =
+256`. Reduce `batch_size_training` if memory is tight and increase
+`gradient_accumulation_steps` proportionally to retain that effective batch.
 
 ### ProsQA QAT grid search
 

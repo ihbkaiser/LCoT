@@ -29,7 +29,8 @@ finite_state:
 save_only_improve: True
 uniform_prob: 0.1
 model_id: configs/symbol-2layer-8head-768dim.json
-# When set, this loads pretrained Hugging Face weights and bypasses model_id.
+# When set, this loads pretrained Hugging Face weights with rank-4 LoRA and
+# bypasses model_id. The base transformer is frozen; the task interfaces train.
 # Set to null to retain the randomly initialized local 2-layer model.
 pretrained_model_id: gpt2
 # Use "stokenizer" for the built-in symbolic tokenizer, or a Hugging Face ID.

@@ -4,6 +4,7 @@
 import torch
 import torch.distributed
 import torch.optim as optim
+from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 
 from stokenizer import STokenizer
@@ -16,6 +17,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
+from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
 
 from coconut import Coconut
 from finite_cot.rbs_adapter import StrictFiniteStateCoconut
@@ -36,6 +38,108 @@ import gc
 import argparse
 import functools
 from utils import Config, set_seed
+
+
+LORA_RANK = 4
+
+
+def add_pretrained_lora(model):
+    """Freeze a pretrained LM and add the trainable task interface and LoRA."""
+
+    model_type = getattr(model.config, "model_type", None)
+    target_modules = None
+    if model_type == "qwen3":
+        # PEFT 0.15 does not provide an automatic Qwen3 mapping. Cover both
+        # attention and MLP projections without adapting embeddings/lm_head.
+        target_modules = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
+
+    model = get_peft_model(
+        model,
+        LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=LORA_RANK,
+            lora_alpha=8,
+            lora_dropout=0.0,
+            bias="none",
+            # Hugging Face GPT-2 projections use Conv1D's transposed weight
+            # layout; standard Linear-based architectures keep the default.
+            fan_in_fan_out=model_type == "gpt2",
+            target_modules=target_modules,
+        ),
+    )
+
+    # The symbolic vocabulary is a new task interface. PEFT freezes the whole
+    # base model, so explicitly keep the resized/tied input and output weights
+    # trainable alongside LoRA. The finite-state modules are constructed later
+    # and are trainable by default.
+    interface_modules = [
+        model.get_input_embeddings(),
+        model.get_output_embeddings(),
+    ]
+    for module in interface_modules:
+        if module is not None:
+            for parameter in module.parameters():
+                parameter.requires_grad = True
+    return model
+
+
+def load_training_checkpoint(model, saved_weights, *, coconut, uses_lora):
+    """Load weights after the final LoRA/Coconut module topology is present."""
+
+    has_coconut_wrapper = any(
+        key.startswith("base_causallm") for key in saved_weights
+    )
+    has_lora = any("lora_" in key for key in saved_weights)
+
+    if uses_lora and not has_lora:
+        raise ValueError(
+            "The selected pretrained model uses LoRA, but the checkpoint has no "
+            "LoRA weights. Pre-LoRA checkpoints are not compatible; start a new "
+            "run or load a checkpoint produced by this LoRA configuration."
+        )
+    if not coconut and has_coconut_wrapper:
+        raise ValueError("Cannot load Coconut model weights into a causal LM model")
+
+    weights_to_load = saved_weights
+    if coconut and not has_coconut_wrapper:
+        # Preserve the existing ability to initialize a non-pretrained Coconut
+        # run from a base causal-LM checkpoint, but load it through the final
+        # wrapper topology rather than loading the model in two different places.
+        weights_to_load = {
+            f"base_causallm.{key}": value for key, value in saved_weights.items()
+        }
+
+    incompatible = model.load_state_dict(weights_to_load, strict=False)
+    if uses_lora:
+        missing_lora = [key for key in incompatible.missing_keys if "lora_" in key]
+        unexpected_lora = [
+            key for key in incompatible.unexpected_keys if "lora_" in key
+        ]
+        if missing_lora or unexpected_lora:
+            raise ValueError(
+                "The checkpoint LoRA topology does not match the current model: "
+                f"missing={missing_lora}, unexpected={unexpected_lora}"
+            )
+    return incompatible
+
+
+def trainable_parameter_counts(model):
+    trainable = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    total = sum(parameter.numel() for parameter in model.parameters())
+    return trainable, total
+
 
 def main():
     parser = argparse.ArgumentParser(description="coconut")
@@ -140,7 +244,8 @@ def main():
     end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
 
     pretrained_model_id = getattr(configs, "pretrained_model_id", None)
-    if pretrained_model_id in {None, "None", ""}:
+    uses_lora = pretrained_model_id not in {None, "None", ""}
+    if not uses_lora:
         if rank == 0:
             print(
                 "Initializing causal LM from model config: "
@@ -172,6 +277,11 @@ def main():
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
 
+    if uses_lora:
+        model = add_pretrained_lora(model)
+        if rank == 0:
+            print(f"Attached LoRA adapters with rank r={LORA_RANK}")
+
     resolved_config_path = os.path.join(save_dir, "model_config.json")
     if rank == 0:
         model.config.to_json_file(resolved_config_path, use_diff=False)
@@ -184,37 +294,10 @@ def main():
 
     print(model)
 
-    loaded = False
-
     if configs.load_model_path != "None":
         saved_weights = torch.load(
             configs.load_model_path, map_location=torch.device(rank)
         )
-
-        if configs.coconut and not any(
-            [k.startswith("base_causallm") for k in saved_weights.keys()]
-        ):
-            # we are loading a base model into coconut model
-            # e.g., for GSM8k, we used a SFTed model to skip the stage 0
-            loaded = True
-            print(model.load_state_dict(saved_weights, strict=False))
-
-        elif not configs.coconut and any(
-            [k.startswith("base_causallm") for k in saved_weights.keys()]
-        ):
-            raise ValueError("Cannot load coconut model weights into a causallm model")
-
-        elif configs.coconut and any(
-            [k.startswith("base_causallm") for k in saved_weights.keys()]
-        ):
-            # loading from preempted run
-            # will handle later
-            pass
-
-        else:
-            # resume or evaluate sft model
-            loaded = True
-            print(model.load_state_dict(saved_weights, strict=False))
 
     if configs.no_thoughts:
         configs.c_thought = 0
@@ -234,8 +317,22 @@ def main():
         else:
             model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id)
 
-    if configs.load_model_path != "None" and not loaded:
-        print(model.load_state_dict(saved_weights, strict=False))
+    if configs.load_model_path != "None":
+        print(
+            load_training_checkpoint(
+                model,
+                saved_weights,
+                coconut=configs.coconut,
+                uses_lora=uses_lora,
+            )
+        )
+
+    if rank == 0:
+        trainable, total = trainable_parameter_counts(model)
+        print(
+            f"Trainable parameters: {trainable:,} / {total:,} "
+            f"({100 * trainable / total:.4f}%)"
+        )
 
     print(f"Running FSDP on rank = {rank}, world size = {world_size}")
     model = model.to(rank)
@@ -244,7 +341,8 @@ def main():
         transformer_auto_wrap_policy,
         transformer_layer_cls={
             # GPT2Block,       # for GPT2, we don't need to shard layers (it becomes DDP)
-            LlamaDecoderLayer  # only shard llama's layers.
+            LlamaDecoderLayer,
+            Qwen3DecoderLayer,
         },
     )
 
@@ -268,7 +366,12 @@ def main():
 
     else:
         parallel_model = FSDP(
-            model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank
+            model,
+            auto_wrap_policy=llama_auto_wrap_policy,
+            device_id=rank,
+            # LoRA mixes frozen base weights with trainable adapters inside
+            # transformer blocks; original parameters must remain distinct.
+            use_orig_params=uses_lora,
         )
 
     del model
@@ -297,7 +400,11 @@ def main():
 
 
     optimizer = optim.AdamW(
-        parallel_model.parameters(),
+        (
+            parameter
+            for parameter in parallel_model.parameters()
+            if parameter.requires_grad
+        ),
         lr=configs.lr,
         weight_decay=configs.weight_decay,
     )
@@ -404,7 +511,11 @@ def main():
                 del optimizer
 
                 optimizer = optim.AdamW(
-                    parallel_model.parameters(),
+                    (
+                        parameter
+                        for parameter in parallel_model.parameters()
+                        if parameter.requires_grad
+                    ),
                     lr=configs.lr,
                     weight_decay=configs.weight_decay,
                 )
