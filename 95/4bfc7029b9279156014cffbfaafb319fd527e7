@@ -1,0 +1,14 @@
+args/prosqa_finite_state_qwen3_0.6b.yaml
+  h_5294c46e116715 12,29-30,40,43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "954bfc7029b9279156014cffbfaafb319fd527e7",
+  "prompts": {},
+  "humans": {
+    "h_5294c46e116715": {
+      "author": "hung20gg <quanghung20gg@gmail.com>"
+    }
+  }
+}
