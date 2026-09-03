@@ -4,7 +4,8 @@
 import torch
 import torch.distributed
 import torch.optim as optim
-from transformers import AutoModelForCausalLM, AutoConfig
+from peft import LoraConfig, TaskType, get_peft_model
+from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 
 from stokenizer import STokenizer
 import wandb
@@ -16,6 +17,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
+from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
 
 from coconut import Coconut
 from finite_cot.rbs_adapter import StrictFiniteStateCoconut
@@ -35,11 +37,249 @@ import json
 import gc
 import argparse
 import functools
+import math
 from utils import Config, set_seed
+
+
+LORA_RANK = 16
+LORA_LEARNING_RATE = 1e-4
+FINITE_PROJECTION_LEARNING_RATE = 3e-4
+WARMUP_RATIO = 0.05
+MAX_GRAD_NORM = 1.0
+
+
+def add_pretrained_lora(model):
+    """Freeze a pretrained LM and add the trainable task interface and LoRA."""
+
+    model_type = getattr(model.config, "model_type", None)
+    target_modules = None
+    if model_type == "qwen3":
+        # PEFT 0.15 does not provide an automatic Qwen3 mapping. Cover both
+        # attention and MLP projections without adapting embeddings/lm_head.
+        target_modules = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            # "gate_proj",
+            # "up_proj",
+            # "down_proj",
+        ]
+
+    model = get_peft_model(
+        model,
+        LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=LORA_RANK,
+            lora_alpha=LORA_RANK*2,
+            lora_dropout=0.05,
+            bias="none",
+            # Hugging Face GPT-2 projections use Conv1D's transposed weight
+            # layout; standard Linear-based architectures keep the default.
+            fan_in_fan_out=model_type == "gpt2",
+            target_modules=target_modules,
+        ),
+    )
+
+    # The symbolic vocabulary is a new task interface. PEFT freezes the whole
+    # base model, so explicitly keep the resized/tied input and output weights
+    # trainable alongside LoRA. The finite-state modules are constructed later
+    # and are trainable by default.
+    interface_modules = [
+        model.get_input_embeddings(),
+        model.get_output_embeddings(),
+    ]
+    for module in interface_modules:
+        if module is not None:
+            for parameter in module.parameters():
+                parameter.requires_grad = True
+    return model
+
+
+def load_training_checkpoint(model, saved_weights, *, coconut, uses_lora):
+    """Load weights after the final LoRA/Coconut module topology is present."""
+
+    has_coconut_wrapper = any(
+        key.startswith("base_causallm") for key in saved_weights
+    )
+    has_lora = any("lora_" in key for key in saved_weights)
+
+    if uses_lora and not has_lora:
+        raise ValueError(
+            "The selected pretrained model uses LoRA, but the checkpoint has no "
+            "LoRA weights. Pre-LoRA checkpoints are not compatible; start a new "
+            "run or load a checkpoint produced by this LoRA configuration."
+        )
+    if not coconut and has_coconut_wrapper:
+        raise ValueError("Cannot load Coconut model weights into a causal LM model")
+
+    weights_to_load = saved_weights
+    if coconut and not has_coconut_wrapper:
+        # Preserve the existing ability to initialize a non-pretrained Coconut
+        # run from a base causal-LM checkpoint, but load it through the final
+        # wrapper topology rather than loading the model in two different places.
+        weights_to_load = {
+            f"base_causallm.{key}": value for key, value in saved_weights.items()
+        }
+
+    incompatible = model.load_state_dict(weights_to_load, strict=False)
+    if uses_lora:
+        missing_lora = [key for key in incompatible.missing_keys if "lora_" in key]
+        unexpected_lora = [
+            key for key in incompatible.unexpected_keys if "lora_" in key
+        ]
+        if missing_lora or unexpected_lora:
+            raise ValueError(
+                "The checkpoint LoRA topology does not match the current model: "
+                f"missing={missing_lora}, unexpected={unexpected_lora}"
+            )
+    return incompatible
+
+
+def trainable_parameter_counts(model):
+    trainable = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    total = sum(parameter.numel() for parameter in model.parameters())
+    return trainable, total
+
+
+def optimizer_parameter_groups(
+    model,
+    learning_rate,
+    *,
+    lora_learning_rate=LORA_LEARNING_RATE,
+    finite_projection_learning_rate=FINITE_PROJECTION_LEARNING_RATE,
+):
+    """Split trainable weights into base, LoRA, and finite-projection groups."""
+
+    grouped = {
+        "base": {"params": [], "lr": learning_rate},
+        "lora": {"params": [], "lr": lora_learning_rate},
+        "finite_projection": {
+            "params": [],
+            "lr": finite_projection_learning_rate,
+        },
+    }
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        normalized_name = name.replace("_fsdp_wrapped_module.", "")
+        if (
+            "bottleneck.up." in normalized_name
+            or "bottleneck.down." in normalized_name
+        ):
+            group_name = "finite_projection"
+        elif "lora_" in normalized_name:
+            group_name = "lora"
+        else:
+            group_name = "base"
+        grouped[group_name]["params"].append(parameter)
+
+    return [
+        {**group, "name": name}
+        for name, group in grouped.items()
+        if group["params"]
+    ]
+
+
+def create_optimizer(model, learning_rate, weight_decay):
+    return optim.AdamW(
+        optimizer_parameter_groups(model, learning_rate),
+        weight_decay=weight_decay,
+    )
+
+
+def create_lr_scheduler(optimizer, num_training_steps, warmup_ratio=WARMUP_RATIO):
+    """Use linear warm-up followed by cosine decay to zero."""
+
+    if num_training_steps < 1:
+        raise ValueError("num_training_steps must be positive")
+    if not 0 <= warmup_ratio < 1:
+        raise ValueError("warmup_ratio must be in [0, 1)")
+    warmup_steps = min(
+        num_training_steps,
+        max(1, math.ceil(num_training_steps * warmup_ratio)),
+    )
+
+    def lr_multiplier(current_step):
+        if current_step < warmup_steps:
+            return current_step / warmup_steps
+        decay_steps = max(1, num_training_steps - warmup_steps)
+        progress = min(1.0, (current_step - warmup_steps) / decay_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_multiplier)
+
+
+def trainable_state_dict(model, state_dict=None):
+    """Return only parameters that are updated during training.
+
+    Tied embedding aliases are intentionally deduplicated: loading any one of
+    their state-dict entries updates the shared input/output parameter. FSDP's
+    internal wrapper component is normalized because it may be present in
+    parameter names while omitted from state-dict keys.
+    """
+
+    def canonical_name(name):
+        return name.replace("_fsdp_wrapped_module.", "")
+
+    trainable_names = {
+        canonical_name(name)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    if state_dict is None:
+        state_dict = model.state_dict()
+    selected = {
+        name: value
+        for name, value in state_dict.items()
+        if canonical_name(name) in trainable_names
+    }
+    if not selected:
+        raise ValueError("No trainable parameters were found for the checkpoint")
+    return selected
+
+
+def checkpoint_path(save_dir, epoch, *, save_best_only=False):
+    """Return the output path for an epoch or single-best checkpoint."""
+
+    filename = "best_model.pt" if save_best_only else f"checkpoint_{epoch}"
+    return os.path.join(save_dir, filename)
+
+
+def stage_checkpoint_path(save_dir, stage):
+    """Return the stable checkpoint path for one curriculum stage."""
+
+    return os.path.join(save_dir, f"best_stage_{stage}.pt")
+
+
+def unwrap_parallel_model(model):
+    """Return the underlying model for plain, DDP, and FSDP execution."""
+
+    return model.module if hasattr(model, "module") else model
+
+
+def checkpoint_state_dict(model, *, uses_fsdp):
+    """Use FSDP's state-dict hooks only when the model is actually sharded."""
+
+    state_model = model if uses_fsdp else unwrap_parallel_model(model)
+    return state_model, state_model.state_dict()
+
 
 def main():
     parser = argparse.ArgumentParser(description="coconut")
     parser.add_argument("config_file")
+    parser.add_argument(
+        "--save-best-only",
+        action="store_true",
+        help=(
+            "save only the weights with the highest validation accuracy, "
+            "overwriting best_model.pt"
+        ),
+    )
     args = parser.parse_args()
     # init distributed environment
     dist.init_process_group("nccl")
@@ -51,11 +291,15 @@ def main():
     # load the configuration file
     with open(args.config_file) as f:
         config_dict = yaml.safe_load(f)
+    if args.save_best_only:
+        config_dict["save_best_only"] = True
 
     if rank == 0:
         print("Config:", config_dict)
 
     configs = Config(config_dict)
+    configs.save_best_only = getattr(configs, "save_best_only", False)
+    configs.save_only_improve = getattr(configs, "save_only_improve", False)
     set_seed(configs.seed)
     save_dir = os.path.join(configs.save_path, configs.name)
 
@@ -64,10 +308,12 @@ def main():
 
     torch.distributed.barrier()
     cur_ckpts = os.listdir(save_dir)
+    checkpoints = [f for f in cur_ckpts if f.startswith("checkpoint_")]
+    checkpoints.sort(key=lambda x: int(x.split("_")[1]))
 
     # check if the job is preempted and resumed.
 
-    if len(cur_ckpts) > 0 and not configs.only_eval:
+    if len(checkpoints) > 0 and not configs.only_eval:
         # if there are previous checkpoints, and only_eval is False
         # it means the previous run was preempted and the program is restarted.
         # need to find the latest checkpoint and resume from that.
@@ -77,11 +323,8 @@ def main():
                 f"Warning: found previous run and gonna resume from that. the inputted `resume` argument is ignored!"
             )
 
-        checkpoints = [f for f in cur_ckpts if f.startswith("checkpoint_")]
-        checkpoints.sort(key=lambda x: int(x.split("_")[1]))
-
         # Get the last item in the sorted list
-        latest_checkpoint = checkpoints[-1] if checkpoints else None
+        latest_checkpoint = checkpoints[-1]
         configs.resume = int(latest_checkpoint.split("_")[1])
         load_dir = os.path.join(configs.save_path, configs.name, latest_checkpoint)
 
@@ -100,48 +343,101 @@ def main():
         )
 
     
-    model = AutoModelForCausalLM.from_config(
-        AutoConfig.from_pretrained(configs.model_id)
-    )
-    
-    print(model)
+    tokenizer_id = getattr(configs, "tokenizer", "stokenizer")
+    if tokenizer_id == "stokenizer":
+        tokenizer = STokenizer()
+        if rank == 0:
+            print("Using built-in tokenizer: stokenizer")
+    else:
+        if rank == 0:
+            print(f"Loading tokenizer from Hugging Face: {tokenizer_id}")
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+        special_tokens = {
+            "additional_special_tokens": [
+                "<|start-latent|>",
+                "<|end-latent|>",
+                "<|latent|>",
+            ]
+        }
+        added_tokens = tokenizer.add_special_tokens(special_tokens)
+        if tokenizer.pad_token_id is None:
+            if tokenizer.eos_token_id is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+                pad_message = f"using EOS token {tokenizer.eos_token!r} as padding"
+            else:
+                added_tokens += tokenizer.add_special_tokens(
+                    {"pad_token": "<|pad|>"}
+                )
+                pad_message = "added <|pad|> as padding"
+        else:
+            pad_message = f"using existing padding token {tokenizer.pad_token!r}"
+        tokenizer.padding_side = "right"
+        if rank == 0:
+            print(
+                f"Registered latent special tokens; added {added_tokens} new "
+                f"tokens; {pad_message}"
+            )
+            print(f"Tokenizer vocabulary size: {len(tokenizer)}")
 
-    tokenizer = STokenizer()
     latent_id = tokenizer.convert_tokens_to_ids("<|latent|>")
     start_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
     end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
 
-    loaded = False
+    pretrained_model_id = getattr(configs, "pretrained_model_id", None)
+    uses_lora = pretrained_model_id not in {None, "None", ""}
+    if not uses_lora:
+        if rank == 0:
+            print(
+                "Initializing causal LM from model config: "
+                f"{configs.model_id} (random weights)"
+            )
+        model = AutoModelForCausalLM.from_config(
+            AutoConfig.from_pretrained(configs.model_id)
+        )
+    else:
+        if rank == 0:
+            print(
+                "Loading pretrained causal LM from Hugging Face: "
+                f"{pretrained_model_id}"
+            )
+            print(f"Bypassing model_id config: {configs.model_id}")
+        model = AutoModelForCausalLM.from_pretrained(pretrained_model_id)
+
+    old_vocab_size = model.get_input_embeddings().num_embeddings
+    if old_vocab_size != len(tokenizer):
+        model.resize_token_embeddings(len(tokenizer))
+        if rank == 0:
+            print(
+                f"Resized model token embeddings: {old_vocab_size} -> "
+                f"{len(tokenizer)}"
+            )
+
+    model.config.vocab_size = len(tokenizer)
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
+    model.config.bos_token_id = tokenizer.bos_token_id
+
+    if uses_lora:
+        model = add_pretrained_lora(model)
+        if rank == 0:
+            print(f"Attached LoRA adapters with rank r={LORA_RANK}")
+
+    resolved_config_path = os.path.join(save_dir, "model_config.json")
+    if rank == 0:
+        model.config.to_json_file(resolved_config_path, use_diff=False)
+        print(f"Saved resolved model config to: {resolved_config_path}")
+        if tokenizer_id != "stokenizer":
+            tokenizer_path = os.path.join(save_dir, "tokenizer")
+            tokenizer.save_pretrained(tokenizer_path)
+            print(f"Saved resolved tokenizer to: {tokenizer_path}")
+    torch.distributed.barrier()
+
+    print(model)
 
     if configs.load_model_path != "None":
         saved_weights = torch.load(
             configs.load_model_path, map_location=torch.device(rank)
         )
-
-        if configs.coconut and not any(
-            [k.startswith("base_causallm") for k in saved_weights.keys()]
-        ):
-            # we are loading a base model into coconut model
-            # e.g., for GSM8k, we used a SFTed model to skip the stage 0
-            loaded = True
-            print(model.load_state_dict(saved_weights, strict=False))
-
-        elif not configs.coconut and any(
-            [k.startswith("base_causallm") for k in saved_weights.keys()]
-        ):
-            raise ValueError("Cannot load coconut model weights into a causallm model")
-
-        elif configs.coconut and any(
-            [k.startswith("base_causallm") for k in saved_weights.keys()]
-        ):
-            # loading from preempted run
-            # will handle later
-            pass
-
-        else:
-            # resume or evaluate sft model
-            loaded = True
-            print(model.load_state_dict(saved_weights, strict=False))
 
     if configs.no_thoughts:
         configs.c_thought = 0
@@ -161,30 +457,65 @@ def main():
         else:
             model = Coconut(model, latent_id, start_id, end_id, tokenizer.eos_token_id)
 
-    if configs.load_model_path != "None" and not loaded:
-        print(model.load_state_dict(saved_weights, strict=False))
+    if configs.load_model_path != "None":
+        print(
+            load_training_checkpoint(
+                model,
+                saved_weights,
+                coconut=configs.coconut,
+                uses_lora=uses_lora,
+            )
+        )
 
-    print(f"Running FSDP on rank = {rank}, world size = {world_size}")
+    if rank == 0:
+        trainable, total = trainable_parameter_counts(model)
+        print(
+            f"Trainable parameters: {trainable:,} / {total:,} "
+            f"({100 * trainable / total:.4f}%)"
+        )
+
     model = model.to(rank)
 
     llama_auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
             # GPT2Block,       # for GPT2, we don't need to shard layers (it becomes DDP)
-            LlamaDecoderLayer  # only shard llama's layers.
+            LlamaDecoderLayer,
+            Qwen3DecoderLayer,
         },
     )
 
-    if configs.bf16:
-        model.to(torch.bfloat16)
+    training_dtype = getattr(configs, "training_dtype", None)
+    if training_dtype is None:
+        training_dtype = "bfloat16" if configs.bf16 else "float32"
+    dtype_map = {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+    }
+    if training_dtype not in dtype_map:
+        raise ValueError(
+            "training_dtype must be float16, float32, or bfloat16"
+        )
+    model.to(dtype_map[training_dtype])
 
-    # if only eval, use ddp (to avoid bugs in fsdp)
-    if configs.only_eval:
+    uses_fsdp = world_size > 1 and not configs.only_eval
+    if world_size == 1:
+        parallel_model = model
+        if rank == 0:
+            print("Running plain PyTorch on one GPU (no DDP/FSDP)")
+    elif configs.only_eval:
         parallel_model = DDP(model, device_ids=[rank])
-
     else:
+        if rank == 0:
+            print(f"Running FSDP with world size {world_size}")
         parallel_model = FSDP(
-            model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank
+            model,
+            auto_wrap_policy=llama_auto_wrap_policy,
+            device_id=rank,
+            # Preserve parameter identities so optimizer groups can distinguish
+            # LoRA and finite-state projection weights after FSDP wrapping.
+            use_orig_params=True,
         )
 
     del model
@@ -212,13 +543,15 @@ def main():
         wandb_run = None
 
 
-    optimizer = optim.AdamW(
-        parallel_model.parameters(),
-        lr=configs.lr,
+    optimizer = create_optimizer(
+        parallel_model,
+        learning_rate=configs.lr,
         weight_decay=configs.weight_decay,
     )
+    lr_scheduler = None
 
-    best_acc = 0
+    best_acc = float("-inf")
+    best_stage_acc = {}
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
 
@@ -319,19 +652,29 @@ def main():
             if configs.reset_optimizer and scheduled_stage < configs.max_latent_stage:
                 del optimizer
 
-                optimizer = optim.AdamW(
-                    parallel_model.parameters(),
-                    lr=configs.lr,
+                optimizer = create_optimizer(
+                    parallel_model,
+                    learning_rate=configs.lr,
                     weight_decay=configs.weight_decay,
                 )
+                lr_scheduler = None
 
-            parallel_model.module.train()
+            updates_per_epoch = math.ceil(
+                len(train_dataloader) / configs.gradient_accumulation_steps
+            )
+            if lr_scheduler is None:
+                lr_scheduler = create_lr_scheduler(
+                    optimizer,
+                    num_training_steps=(configs.num_epochs - epoch)
+                    * updates_per_epoch,
+                )
 
-            total_length = len(train_dataloader) // configs.gradient_accumulation_steps
+            unwrap_parallel_model(parallel_model).train()
+
             pbar = tqdm(
                 colour="blue",
                 desc=f"Training Epoch: {epoch+1}",
-                total=total_length,
+                total=updates_per_epoch,
                 dynamic_ncols=True,
             )
 
@@ -377,7 +720,14 @@ def main():
                 if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
                     train_dataloader
                 ) - 1:
+                    if uses_fsdp:
+                        grad_norm = parallel_model.clip_grad_norm_(MAX_GRAD_NORM)
+                    else:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            parallel_model.parameters(), MAX_GRAD_NORM
+                        )
                     optimizer.step()
+                    lr_scheduler.step()
                     optimizer.zero_grad()
                     pbar.update(1)
 
@@ -388,6 +738,12 @@ def main():
                         "train/loss": loss.detach().float()
                         * configs.gradient_accumulation_steps,
                     }
+                    if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
+                        train_dataloader
+                    ) - 1:
+                        log_dict["train/grad_norm"] = grad_norm.detach().float()
+                        for group in optimizer.param_groups:
+                            log_dict[f"train/lr_{group['name']}"] = group["lr"]
                     wandb_run.log(log_dict)
 
                 pbar.set_description(
@@ -399,13 +755,19 @@ def main():
 
             if (
                 not configs.save_only_improve
+                and not configs.save_best_only
                 and not configs.debug
                 and not configs.only_eval
             ):
-                states = parallel_model.state_dict()
+                state_model, states = checkpoint_state_dict(
+                    parallel_model, uses_fsdp=uses_fsdp
+                )
+                if uses_lora:
+                    states = trainable_state_dict(state_model, states)
                 if rank == 0:
                     torch.save(
-                        states, os.path.join(save_dir, f"checkpoint_{epoch + 1}")
+                        states,
+                        checkpoint_path(save_dir, epoch + 1),
                     )
                     print("saving model.")
 
@@ -418,7 +780,7 @@ def main():
             total_loss = 0
 
             with torch.no_grad():
-                parallel_model.module.eval()
+                unwrap_parallel_model(parallel_model).eval()
                 for step, batch in enumerate(valid_loss_dataloader):
 
                     batch = {
@@ -453,7 +815,7 @@ def main():
             )
 
             with torch.no_grad():
-                parallel_model.module.eval()
+                unwrap_parallel_model(parallel_model).eval()
                 for idx, batch in enumerate(valid_gen_dataloader):
                     test_idx = batch["idx"][0]
 
@@ -473,24 +835,24 @@ def main():
 
                     # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
                     if configs.cot:
-                        outputs = parallel_model.module.generate(
+                        outputs = unwrap_parallel_model(parallel_model).generate(
                             **batch,
                             max_new_tokens=64,
-                            synced_gpus=not configs.only_eval,
+                            synced_gpus=world_size > 1 and not configs.only_eval,
                             eos_token_id=tokenizer.eos_token_id,
                         )
                     elif configs.no_cot:
-                        outputs = parallel_model.module.generate(
+                        outputs = unwrap_parallel_model(parallel_model).generate(
                             **batch,
                             max_new_tokens=64,
-                            synced_gpus=not configs.only_eval,
+                            synced_gpus=world_size > 1 and not configs.only_eval,
                             eos_token_id=tokenizer.eos_token_id,
                         )
                     else:
-                        outputs = parallel_model.module.generate(
+                        outputs = unwrap_parallel_model(parallel_model).generate(
                             **batch,
                         max_new_tokens=1,
-                        synced_gpus=not configs.only_eval,
+                        synced_gpus=world_size > 1 and not configs.only_eval,
                         eos_token_id=tokenizer.eos_token_id,
                     )
 
@@ -538,24 +900,53 @@ def main():
                 break
 
             dist.barrier()
+            accuracy = cor / total
+            global_improved = accuracy > best_acc
+            stage_improved = accuracy > best_stage_acc.get(
+                scheduled_stage, float("-inf")
+            )
+            save_global_best = global_improved and (
+                configs.save_only_improve or configs.save_best_only
+            )
             if (
-                cor / total > best_acc
-                and configs.save_only_improve
+                (save_global_best or stage_improved)
                 and not configs.debug
                 and not configs.only_eval
             ):
-                states = parallel_model.state_dict()
+                state_model, states = checkpoint_state_dict(
+                    parallel_model, uses_fsdp=uses_fsdp
+                )
+                if uses_lora:
+                    states = trainable_state_dict(state_model, states)
 
                 if rank == 0:
-                    torch.save(states, os.path.join(save_dir, f"checkpoint_{epoch + 1}"))
-                    print("saving model.")
-
-                best_acc = cor / total
+                    if save_global_best:
+                        output_path = checkpoint_path(
+                            save_dir,
+                            epoch + 1,
+                            save_best_only=configs.save_best_only,
+                        )
+                        torch.save(states, output_path)
+                        print(f"saving global best model to {output_path}.")
+                    if stage_improved:
+                        output_path = stage_checkpoint_path(
+                            save_dir, scheduled_stage
+                        )
+                        torch.save(states, output_path)
+                        print(
+                            f"saving stage {scheduled_stage} best from epoch "
+                            f"{epoch + 1} to {output_path}."
+                        )
 
                 dist.barrier()
                 del states
                 gc.collect()
                 torch.cuda.empty_cache()
+
+            if global_improved:
+                best_acc = accuracy
+            if stage_improved:
+                best_stage_acc[scheduled_stage] = accuracy
 
 
 if __name__ == "__main__":

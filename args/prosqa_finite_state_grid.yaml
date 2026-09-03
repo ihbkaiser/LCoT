@@ -1,0 +1,12 @@
+# Sequential QAT grid. The floating training dtype is fixed; only d and model_bits
+# participate in the Cartesian product.
+base_config: args/prosqa_finite_state_qwen3_0.6b.yaml
+name_prefix: prosqa-finite-state-readonly-qat
+output_dir: results/prosqa_grid
+nproc_per_node: 1
+
+training_dtype: float32
+
+grid:
+  state_dim: [16, 32, 64]
+  model_bits: [ 4, 8]

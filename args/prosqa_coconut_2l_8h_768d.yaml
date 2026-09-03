@@ -19,7 +19,7 @@ pad_latent_to_max: True
 save_only_improve: False
 uniform_prob: 0.1
 model_id: configs/symbol-2layer-8head-768dim.json
-load_model_path: None
+load_model_path: ckpts/prosqa-coconut-2l-8h-768d/checkpoint_300
 seed: 0
 resume: 0
 bf16: False
