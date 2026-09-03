@@ -250,6 +250,12 @@ def checkpoint_path(save_dir, epoch, *, save_best_only=False):
     return os.path.join(save_dir, filename)
 
 
+def stage_checkpoint_path(save_dir, stage):
+    """Return the stable checkpoint path for one curriculum stage."""
+
+    return os.path.join(save_dir, f"best_stage_{stage}.pt")
+
+
 def unwrap_parallel_model(model):
     """Return the underlying model for plain, DDP, and FSDP execution."""
 
@@ -545,6 +551,7 @@ def main():
     lr_scheduler = None
 
     best_acc = float("-inf")
+    best_stage_acc = {}
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
 
@@ -893,9 +900,16 @@ def main():
                 break
 
             dist.barrier()
+            accuracy = cor / total
+            global_improved = accuracy > best_acc
+            stage_improved = accuracy > best_stage_acc.get(
+                scheduled_stage, float("-inf")
+            )
+            save_global_best = global_improved and (
+                configs.save_only_improve or configs.save_best_only
+            )
             if (
-                cor / total > best_acc
-                and (configs.save_only_improve or configs.save_best_only)
+                (save_global_best or stage_improved)
                 and not configs.debug
                 and not configs.only_eval
             ):
@@ -906,20 +920,33 @@ def main():
                     states = trainable_state_dict(state_model, states)
 
                 if rank == 0:
-                    output_path = checkpoint_path(
-                        save_dir,
-                        epoch + 1,
-                        save_best_only=configs.save_best_only,
-                    )
-                    torch.save(states, output_path)
-                    print(f"saving model to {output_path}.")
-
-                best_acc = cor / total
+                    if save_global_best:
+                        output_path = checkpoint_path(
+                            save_dir,
+                            epoch + 1,
+                            save_best_only=configs.save_best_only,
+                        )
+                        torch.save(states, output_path)
+                        print(f"saving global best model to {output_path}.")
+                    if stage_improved:
+                        output_path = stage_checkpoint_path(
+                            save_dir, scheduled_stage
+                        )
+                        torch.save(states, output_path)
+                        print(
+                            f"saving stage {scheduled_stage} best from epoch "
+                            f"{epoch + 1} to {output_path}."
+                        )
 
                 dist.barrier()
                 del states
                 gc.collect()
                 torch.cuda.empty_cache()
+
+            if global_improved:
+                best_acc = accuracy
+            if stage_improved:
+                best_stage_acc[scheduled_stage] = accuracy
 
 
 if __name__ == "__main__":

@@ -165,12 +165,13 @@ torchrun --standalone --nnodes=1 --nproc_per_node=1 run.py \
   args/prosqa_finite_state_qwen3_0.6b.yaml
 ```
 
-With `save_best_only: true`, each validation-accuracy improvement overwrites
-`ckpts/prosqa-qwen3-0.6b-finite-state-d64-p2-readonly/best_model.pt`, so the run
-retains one model-weight file. For LoRA runs, that file contains only trainable
-weights: the LoRA adapters, token embeddings/LM head, and finite-state modules;
-the frozen Qwen base is not duplicated. The same best-only behavior can be
-enabled for any config with the `--save-best-only` command-line flag.
+With `save_best_only: true`, each global validation-accuracy improvement
+overwrites `best_model.pt`. The best epoch within each curriculum stage is also
+retained as `best_stage_<stage>.pt` and overwritten only when that stage's score
+improves. For LoRA runs, these files contain only trainable weights: the LoRA
+adapters, token embeddings/LM head, and finite-state modules; the frozen Qwen
+base is not duplicated. The same best-only behavior can be enabled for any
+config with the `--save-best-only` command-line flag.
 
 The effective global batch size is `1 GPU * 2 examples * 64 accumulation =
 128`. Reduce `batch_size_training` if memory is tight and increase
