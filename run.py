@@ -37,10 +37,15 @@ import json
 import gc
 import argparse
 import functools
+import math
 from utils import Config, set_seed
 
 
 LORA_RANK = 16
+LORA_LEARNING_RATE = 1e-4
+FINITE_PROJECTION_LEARNING_RATE = 3e-4
+WARMUP_RATIO = 0.05
+MAX_GRAD_NORM = 1.0
 
 
 def add_pretrained_lora(model):
@@ -139,6 +144,74 @@ def trainable_parameter_counts(model):
     )
     total = sum(parameter.numel() for parameter in model.parameters())
     return trainable, total
+
+
+def optimizer_parameter_groups(
+    model,
+    learning_rate,
+    *,
+    lora_learning_rate=LORA_LEARNING_RATE,
+    finite_projection_learning_rate=FINITE_PROJECTION_LEARNING_RATE,
+):
+    """Split trainable weights into base, LoRA, and finite-projection groups."""
+
+    grouped = {
+        "base": {"params": [], "lr": learning_rate},
+        "lora": {"params": [], "lr": lora_learning_rate},
+        "finite_projection": {
+            "params": [],
+            "lr": finite_projection_learning_rate,
+        },
+    }
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        normalized_name = name.replace("_fsdp_wrapped_module.", "")
+        if (
+            "bottleneck.up." in normalized_name
+            or "bottleneck.down." in normalized_name
+        ):
+            group_name = "finite_projection"
+        elif "lora_" in normalized_name:
+            group_name = "lora"
+        else:
+            group_name = "base"
+        grouped[group_name]["params"].append(parameter)
+
+    return [
+        {**group, "name": name}
+        for name, group in grouped.items()
+        if group["params"]
+    ]
+
+
+def create_optimizer(model, learning_rate, weight_decay):
+    return optim.AdamW(
+        optimizer_parameter_groups(model, learning_rate),
+        weight_decay=weight_decay,
+    )
+
+
+def create_lr_scheduler(optimizer, num_training_steps, warmup_ratio=WARMUP_RATIO):
+    """Use linear warm-up followed by cosine decay to zero."""
+
+    if num_training_steps < 1:
+        raise ValueError("num_training_steps must be positive")
+    if not 0 <= warmup_ratio < 1:
+        raise ValueError("warmup_ratio must be in [0, 1)")
+    warmup_steps = min(
+        num_training_steps,
+        max(1, math.ceil(num_training_steps * warmup_ratio)),
+    )
+
+    def lr_multiplier(current_step):
+        if current_step < warmup_steps:
+            return current_step / warmup_steps
+        decay_steps = max(1, num_training_steps - warmup_steps)
+        progress = min(1.0, (current_step - warmup_steps) / decay_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_multiplier)
 
 
 def trainable_state_dict(model, state_dict=None):
@@ -434,9 +507,9 @@ def main():
             model,
             auto_wrap_policy=llama_auto_wrap_policy,
             device_id=rank,
-            # LoRA mixes frozen base weights with trainable adapters inside
-            # transformer blocks; original parameters must remain distinct.
-            use_orig_params=uses_lora,
+            # Preserve parameter identities so optimizer groups can distinguish
+            # LoRA and finite-state projection weights after FSDP wrapping.
+            use_orig_params=True,
         )
 
     del model
@@ -464,15 +537,12 @@ def main():
         wandb_run = None
 
 
-    optimizer = optim.AdamW(
-        (
-            parameter
-            for parameter in parallel_model.parameters()
-            if parameter.requires_grad
-        ),
-        lr=configs.lr,
+    optimizer = create_optimizer(
+        parallel_model,
+        learning_rate=configs.lr,
         weight_decay=configs.weight_decay,
     )
+    lr_scheduler = None
 
     best_acc = float("-inf")
 
@@ -575,23 +645,29 @@ def main():
             if configs.reset_optimizer and scheduled_stage < configs.max_latent_stage:
                 del optimizer
 
-                optimizer = optim.AdamW(
-                    (
-                        parameter
-                        for parameter in parallel_model.parameters()
-                        if parameter.requires_grad
-                    ),
-                    lr=configs.lr,
+                optimizer = create_optimizer(
+                    parallel_model,
+                    learning_rate=configs.lr,
                     weight_decay=configs.weight_decay,
+                )
+                lr_scheduler = None
+
+            updates_per_epoch = math.ceil(
+                len(train_dataloader) / configs.gradient_accumulation_steps
+            )
+            if lr_scheduler is None:
+                lr_scheduler = create_lr_scheduler(
+                    optimizer,
+                    num_training_steps=(configs.num_epochs - epoch)
+                    * updates_per_epoch,
                 )
 
             unwrap_parallel_model(parallel_model).train()
 
-            total_length = len(train_dataloader) // configs.gradient_accumulation_steps
             pbar = tqdm(
                 colour="blue",
                 desc=f"Training Epoch: {epoch+1}",
-                total=total_length,
+                total=updates_per_epoch,
                 dynamic_ncols=True,
             )
 
@@ -637,7 +713,14 @@ def main():
                 if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
                     train_dataloader
                 ) - 1:
+                    if uses_fsdp:
+                        grad_norm = parallel_model.clip_grad_norm_(MAX_GRAD_NORM)
+                    else:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            parallel_model.parameters(), MAX_GRAD_NORM
+                        )
                     optimizer.step()
+                    lr_scheduler.step()
                     optimizer.zero_grad()
                     pbar.update(1)
 
@@ -648,6 +731,12 @@ def main():
                         "train/loss": loss.detach().float()
                         * configs.gradient_accumulation_steps,
                     }
+                    if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
+                        train_dataloader
+                    ) - 1:
+                        log_dict["train/grad_norm"] = grad_norm.detach().float()
+                        for group in optimizer.param_groups:
+                            log_dict[f"train/lr_{group['name']}"] = group["lr"]
                     wandb_run.log(log_dict)
 
                 pbar.set_description(

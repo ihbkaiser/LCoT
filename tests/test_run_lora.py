@@ -6,9 +6,13 @@ from transformers import GPT2Config, GPT2LMHeadModel, Qwen3Config, Qwen3ForCausa
 
 from finite_cot.rbs_adapter import StrictFiniteStateCoconut
 from run import (
+    FINITE_PROJECTION_LEARNING_RATE,
     LORA_RANK,
+    LORA_LEARNING_RATE,
     add_pretrained_lora,
     checkpoint_path,
+    create_optimizer,
+    create_lr_scheduler,
     load_training_checkpoint,
     trainable_state_dict,
 )
@@ -57,6 +61,53 @@ def finite_config():
 
 
 class RunLoraTests(unittest.TestCase):
+    def test_scheduler_linearly_warms_up_then_cosine_decays(self):
+        parameter = torch.nn.Parameter(torch.ones(()))
+        optimizer = torch.optim.AdamW([parameter], lr=1e-4)
+        scheduler = create_lr_scheduler(
+            optimizer, num_training_steps=100, warmup_ratio=0.05
+        )
+
+        self.assertEqual(optimizer.param_groups[0]["lr"], 0.0)
+        for _ in range(5):
+            optimizer.step()
+            scheduler.step()
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 1e-4)
+        for _ in range(95):
+            optimizer.step()
+            scheduler.step()
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.0)
+
+    def test_optimizer_uses_distinct_lora_and_finite_projection_rates(self):
+        model = StrictFiniteStateCoconut(
+            add_pretrained_lora(tiny_gpt2()), 33, 31, 32, 38, finite_config()
+        )
+        optimizer = create_optimizer(model, learning_rate=2e-4, weight_decay=0.01)
+        groups = {group["name"]: group for group in optimizer.param_groups}
+
+        self.assertEqual(groups["base"]["lr"], 2e-4)
+        self.assertEqual(groups["lora"]["lr"], LORA_LEARNING_RATE)
+        self.assertEqual(
+            groups["finite_projection"]["lr"],
+            FINITE_PROJECTION_LEARNING_RATE,
+        )
+
+        parameter_groups = {
+            id(parameter): group["name"]
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        }
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if "bottleneck.up." in name or "bottleneck.down." in name:
+                expected = "finite_projection"
+            elif "lora_" in name:
+                expected = "lora"
+            else:
+                expected = "base"
+            self.assertEqual(parameter_groups[id(parameter)], expected, name)
+
     def test_best_only_checkpoint_uses_stable_path(self):
         self.assertEqual(
             checkpoint_path("ckpts/run", 7, save_best_only=True),
