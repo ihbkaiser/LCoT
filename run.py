@@ -40,7 +40,7 @@ import functools
 from utils import Config, set_seed
 
 
-LORA_RANK = 4
+LORA_RANK = 16
 
 
 def add_pretrained_lora(model):
@@ -56,9 +56,9 @@ def add_pretrained_lora(model):
             "k_proj",
             "v_proj",
             "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
+            # "gate_proj",
+            # "up_proj",
+            # "down_proj",
         ]
 
     model = get_peft_model(
@@ -66,8 +66,8 @@ def add_pretrained_lora(model):
         LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=LORA_RANK,
-            lora_alpha=8,
-            lora_dropout=0.0,
+            lora_alpha=LORA_RANK*2,
+            lora_dropout=0.05,
             bias="none",
             # Hugging Face GPT-2 projections use Conv1D's transposed weight
             # layout; standard Linear-based architectures keep the default.
