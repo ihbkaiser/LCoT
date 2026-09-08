@@ -12,7 +12,7 @@ no_cot: False
 
 c_thought: 1
 epochs_per_stage: 25
-max_latent_stage: 4
+max_latent_stage: 8
 pad_latent_to_max: True
 
 finite_state:
