@@ -2,7 +2,14 @@ import os
 import unittest
 
 import torch
-from transformers import GPT2Config, GPT2LMHeadModel, Qwen3Config, Qwen3ForCausalLM
+from transformers import (
+    GPT2Config,
+    GPT2LMHeadModel,
+    LlamaConfig,
+    LlamaForCausalLM,
+    Qwen3Config,
+    Qwen3ForCausalLM,
+)
 
 from finite_cot.rbs_adapter import StrictFiniteStateCoconut
 from run import (
@@ -14,6 +21,8 @@ from run import (
     create_optimizer,
     create_lr_scheduler,
     load_training_checkpoint,
+    pretrained_model_load_kwargs,
+    resolve_training_dtype,
     trainable_state_dict,
 )
 
@@ -46,6 +55,23 @@ def tiny_qwen3():
             head_dim=8,
             max_position_embeddings=32,
             use_sliding_window=False,
+        )
+    )
+
+
+def tiny_llama():
+    return LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=32,
+            bos_token_id=60,
+            eos_token_id=61,
+            pad_token_id=62,
         )
     )
 
@@ -148,7 +174,7 @@ class RunLoraTests(unittest.TestCase):
         self.assertTrue(frozen_base)
         self.assertTrue(all(not parameter.requires_grad for parameter in frozen_base))
 
-    def test_qwen3_lora_targets_attention_and_mlp_projections(self):
+    def test_qwen3_lora_keeps_existing_attention_projection_topology(self):
         model = add_pretrained_lora(tiny_qwen3())
         self.assertEqual(
             model.peft_config["default"].target_modules,
@@ -157,11 +183,84 @@ class RunLoraTests(unittest.TestCase):
                 "k_proj",
                 "v_proj",
                 "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
             },
         )
+
+    def test_llama_lora_targets_attention_projections(self):
+        model = add_pretrained_lora(tiny_llama())
+        self.assertEqual(
+            model.peft_config["default"].target_modules,
+            {
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+            },
+        )
+
+    def test_llama_can_freeze_large_token_interfaces(self):
+        model = add_pretrained_lora(
+            tiny_llama(),
+            train_task_interfaces=False,
+        )
+        self.assertFalse(model.get_input_embeddings().weight.requires_grad)
+        self.assertFalse(model.get_output_embeddings().weight.requires_grad)
+        self.assertTrue(
+            any(
+                parameter.requires_grad
+                for name, parameter in model.named_parameters()
+                if "lora_" in name
+            )
+        )
+
+    def test_pretrained_loading_uses_resolved_dtype_and_low_memory(self):
+        class DummyConfig:
+            training_dtype = "bfloat16"
+            bf16 = True
+            low_cpu_mem_usage = True
+            attn_implementation = "sdpa"
+
+        name, dtype = resolve_training_dtype(DummyConfig())
+        kwargs = pretrained_model_load_kwargs(DummyConfig(), dtype)
+        self.assertEqual(name, "bfloat16")
+        self.assertEqual(dtype, torch.bfloat16)
+        self.assertEqual(kwargs["torch_dtype"], torch.bfloat16)
+        self.assertTrue(kwargs["low_cpu_mem_usage"])
+        self.assertEqual(kwargs["attn_implementation"], "sdpa")
+
+    def test_tiny_llama_finite_state_forward_backward(self):
+        model = StrictFiniteStateCoconut(
+            add_pretrained_lora(
+                tiny_llama(),
+                train_task_interfaces=False,
+            ),
+            33,
+            31,
+            32,
+            61,
+            finite_config(),
+        )
+        input_ids = torch.tensor([[35, 1, 31, 33, 33, 32, 37]])
+        attention_mask = torch.ones_like(input_ids)
+        labels = torch.full_like(input_ids, -100)
+        labels[0, -1] = 37
+
+        output = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+        )
+        output.loss.backward()
+
+        self.assertTrue(torch.isfinite(output.loss))
+        self.assertTrue(
+            any(
+                parameter.grad is not None
+                for name, parameter in model.named_parameters()
+                if "lora_" in name
+            )
+        )
+        self.assertTrue(model.bottleneck.down.weight.grad is not None)
 
     def test_discrete_state_expands_back_to_transformer_width(self):
         model = StrictFiniteStateCoconut(

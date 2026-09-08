@@ -75,9 +75,12 @@ class StrictFiniteStateCoconut(nn.Module):
     def _base(self, embeds: Tensor, *, hidden: bool = False):
         self.gen_forward_cnt += 1
         kwargs = {}
-        if hidden and getattr(self.base_causallm.config, "model_type", None) == "qwen3":
+        if hidden and getattr(self.base_causallm.config, "model_type", None) in {
+            "qwen3",
+            "llama",
+        }:
             # State updates only consume the final hidden state. Avoid projecting
-            # every prefix position over Qwen's full vocabulary.
+            # every prefix position over a large Qwen/Llama vocabulary.
             kwargs["logits_to_keep"] = 1
         return self.base_causallm(
             inputs_embeds=embeds,
@@ -102,7 +105,10 @@ class StrictFiniteStateCoconut(nn.Module):
         attention_mask = positions.unsqueeze(0) < lengths.unsqueeze(1)
         self.gen_forward_cnt += 1
         kwargs = {}
-        if getattr(self.base_causallm.config, "model_type", None) == "qwen3":
+        if getattr(self.base_causallm.config, "model_type", None) in {
+            "qwen3",
+            "llama",
+        }:
             kwargs["logits_to_keep"] = 1
         outputs = self.base_causallm(
             inputs_embeds=padded,

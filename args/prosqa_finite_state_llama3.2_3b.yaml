@@ -1,0 +1,53 @@
+project: finite-cot
+save_path: ckpts
+name: prosqa-llama3.2-3b-finite-state-d64-p2-readonly
+
+only_eval: false
+coconut: true
+cot: false
+no_thoughts: false
+no_cot: false
+
+c_thought: 1
+epochs_per_stage: 25
+max_latent_stage: 4
+pad_latent_to_max: true
+
+finite_state:
+  enabled: true
+  state_dim: 64
+  model_bits: 2
+  bits_per_coordinate: 2
+  clip_value: 1.0
+  learnable_clip: false
+  access_mode: readonly_input
+
+save_only_improve: true
+save_best_only: true
+uniform_prob: 0.1
+model_id: configs/symbol-2layer-8head-768dim.json # bypassed for pretrained runs
+pretrained_model_id: meta-llama/Llama-3.2-3B
+tokenizer: meta-llama/Llama-3.2-3B
+load_model_path: None
+
+seed: 17
+resume: 0
+bf16: true
+training_dtype: bfloat16
+low_cpu_mem_usage: true
+attn_implementation: sdpa
+gradient_checkpointing: true
+# StrictFiniteStateCoconut never embeds the latent IDs themselves, and ProsQA
+# never supervises them as output labels. Freezing the large Llama embedding
+# and LM-head matrices avoids several GB of gradient/Adam state.
+train_task_interfaces: false
+
+train_path: data/prosqa_train_graph_4_coconut.json
+val_path: data/prosqa_valid_graph_4_coconut.json
+reset_optimizer: false
+batch_size_training: 1
+debug: false
+gradient_accumulation_steps: 32
+num_epochs: 300
+lr: 1.0e-4
+weight_decay: 0.01

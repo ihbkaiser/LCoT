@@ -81,11 +81,14 @@ adding the finite-state CCoT bottleneck. This bypasses `model_id`, resizes the
 language-model vocabulary to `STokenizer`, and writes the resolved Hugging Face
 configuration to `<save_path>/<name>/model_config.json`. Set it to `null` to
 construct random weights from the local `model_id` configuration instead.
-Pretrained models are adapted with rank-4 LoRA: the original transformer is
-frozen, while LoRA weights, the resized token input/output interface, and the
-finite-state bottleneck remain trainable. Resumed pretrained runs must use a
-checkpoint created with this LoRA topology; older full-finetuning checkpoints
-are rejected with a compatibility error.
+Pretrained models are adapted with rank-16 LoRA. By default the original
+transformer is frozen while LoRA weights, the resized token input/output
+interface, and the finite-state bottleneck remain trainable. Large-vocabulary
+models can set `train_task_interfaces: false` to keep the full embedding and LM
+head frozen; this is the recommended strict finite-state Llama configuration.
+Resumed pretrained runs must use a checkpoint created with the same LoRA
+topology; older full-finetuning checkpoints are rejected with a compatibility
+error.
 
 Both vocabulary and latent inputs preserve the transformer's hidden width.
 Vocabulary IDs map directly to vectors of width `H`; a latent hidden vector is
@@ -176,6 +179,39 @@ config with the `--save-best-only` command-line flag.
 The effective global batch size is `1 GPU * 2 examples * 64 accumulation =
 128`. Reduce `batch_size_training` if memory is tight and increase
 `gradient_accumulation_steps` proportionally to retain that effective batch.
+
+### Llama 3.2-3B LoRA run
+
+`args/prosqa_finite_state_llama3.2_3b.yaml` provides a conservative single-GPU
+starting point for `meta-llama/Llama-3.2-3B`. It loads the checkpoint directly
+in BF16, uses SDPA, enables non-reentrant gradient checkpointing, and freezes
+the large token embedding/LM-head matrices while training LoRA plus the finite
+state bottleneck. To keep the first 3B run small and preserve the existing Qwen
+LoRA topology, Llama initially adapts only the attention projections
+(`q/k/v/o_proj`).
+
+Before launching a full ProsQA curriculum, run the one-step smoke test:
+
+```bash
+python scripts/smoke_llama32_3b.py
+```
+
+The smoke test loads the real 3B checkpoint, adds the latent tokens, performs a
+finite-state forward/backward/optimizer step, checks that LoRA and bottleneck
+gradients are non-zero, and prints peak CUDA allocated/reserved memory. The
+model repository may require accepting Meta's license and authenticating with
+Hugging Face first.
+
+Then launch training with:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=1 run.py \
+  args/prosqa_finite_state_llama3.2_3b.yaml
+```
+
+The Llama config starts at `batch_size_training: 1` and
+`gradient_accumulation_steps: 32`. Increase the micro-batch only after the
+smoke test and an initial training step establish available VRAM headroom.
 
 ### ProsQA QAT grid search
 

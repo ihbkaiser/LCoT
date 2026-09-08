@@ -48,22 +48,20 @@ WARMUP_RATIO = 0.05
 MAX_GRAD_NORM = 1.0
 
 
-def add_pretrained_lora(model):
+def add_pretrained_lora(model, *, train_task_interfaces=True):
     """Freeze a pretrained LM and add the trainable task interface and LoRA."""
 
     model_type = getattr(model.config, "model_type", None)
     target_modules = None
-    if model_type == "qwen3":
-        # PEFT 0.15 does not provide an automatic Qwen3 mapping. Cover both
-        # attention and MLP projections without adapting embeddings/lm_head.
+    if model_type in {"qwen3", "llama"}:
+        # Keep the existing Qwen attention-only topology and use the same small
+        # explicit surface for Llama. This avoids silently invalidating Qwen
+        # checkpoints while keeping the 3B Llama adapter memory modest.
         target_modules = [
             "q_proj",
             "k_proj",
             "v_proj",
             "o_proj",
-            # "gate_proj",
-            # "up_proj",
-            # "down_proj",
         ]
 
     model = get_peft_model(
@@ -81,19 +79,52 @@ def add_pretrained_lora(model):
         ),
     )
 
-    # The symbolic vocabulary is a new task interface. PEFT freezes the whole
-    # base model, so explicitly keep the resized/tied input and output weights
-    # trainable alongside LoRA. The finite-state modules are constructed later
-    # and are trainable by default.
-    interface_modules = [
-        model.get_input_embeddings(),
-        model.get_output_embeddings(),
-    ]
-    for module in interface_modules:
-        if module is not None:
-            for parameter in module.parameters():
-                parameter.requires_grad = True
+    if train_task_interfaces:
+        # The symbolic vocabulary is a new task interface. PEFT freezes the
+        # whole base model, so explicitly keep the resized/tied input and output
+        # weights trainable alongside LoRA when requested. For strict
+        # finite-state ProsQA this can safely be disabled to avoid optimizer
+        # state for a very large Llama vocabulary: latent IDs are intercepted
+        # by StrictFiniteStateCoconut before embedding lookup, and labels never
+        # supervise the latent markers.
+        interface_modules = [
+            model.get_input_embeddings(),
+            model.get_output_embeddings(),
+        ]
+        for module in interface_modules:
+            if module is not None:
+                for parameter in module.parameters():
+                    parameter.requires_grad = True
     return model
+
+
+def resolve_training_dtype(configs):
+    """Resolve the configured training dtype once for loading and execution."""
+
+    training_dtype = getattr(configs, "training_dtype", None)
+    if training_dtype is None:
+        training_dtype = "bfloat16" if configs.bf16 else "float32"
+    dtype_map = {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+    }
+    if training_dtype not in dtype_map:
+        raise ValueError("training_dtype must be float16, float32, or bfloat16")
+    return training_dtype, dtype_map[training_dtype]
+
+
+def pretrained_model_load_kwargs(configs, torch_dtype):
+    """Memory-conscious Hugging Face loading options for pretrained runs."""
+
+    kwargs = {
+        "torch_dtype": torch_dtype,
+        "low_cpu_mem_usage": bool(getattr(configs, "low_cpu_mem_usage", True)),
+    }
+    attn_implementation = getattr(configs, "attn_implementation", None)
+    if attn_implementation not in {None, "None", ""}:
+        kwargs["attn_implementation"] = attn_implementation
+    return kwargs
 
 
 def load_training_checkpoint(model, saved_weights, *, coconut, uses_lora):
@@ -385,6 +416,7 @@ def main():
 
     pretrained_model_id = getattr(configs, "pretrained_model_id", None)
     uses_lora = pretrained_model_id not in {None, "None", ""}
+    training_dtype, training_torch_dtype = resolve_training_dtype(configs)
     if not uses_lora:
         if rank == 0:
             print(
@@ -401,7 +433,10 @@ def main():
                 f"{pretrained_model_id}"
             )
             print(f"Bypassing model_id config: {configs.model_id}")
-        model = AutoModelForCausalLM.from_pretrained(pretrained_model_id)
+        model = AutoModelForCausalLM.from_pretrained(
+            pretrained_model_id,
+            **pretrained_model_load_kwargs(configs, training_torch_dtype),
+        )
 
     old_vocab_size = model.get_input_embeddings().num_embeddings
     if old_vocab_size != len(tokenizer):
@@ -417,10 +452,30 @@ def main():
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
 
+    if getattr(configs, "gradient_checkpointing", False):
+        # Non-reentrant checkpointing is important when the frozen prefix
+        # embeddings themselves do not require gradients but LoRA weights do.
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        model.config.use_cache = False
+        if rank == 0:
+            print("Enabled gradient checkpointing (use_reentrant=False)")
+
     if uses_lora:
-        model = add_pretrained_lora(model)
+        train_task_interfaces = bool(
+            getattr(configs, "train_task_interfaces", True)
+        )
+        model = add_pretrained_lora(
+            model,
+            train_task_interfaces=train_task_interfaces,
+        )
         if rank == 0:
             print(f"Attached LoRA adapters with rank r={LORA_RANK}")
+            print(
+                "Train resized token input/output interface: "
+                f"{train_task_interfaces}"
+            )
 
     resolved_config_path = os.path.join(save_dir, "model_config.json")
     if rank == 0:
@@ -474,7 +529,7 @@ def main():
             f"({100 * trainable / total:.4f}%)"
         )
 
-    model = model.to(rank)
+    model = model.to(device=rank, dtype=training_torch_dtype)
 
     llama_auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
@@ -484,20 +539,6 @@ def main():
             Qwen3DecoderLayer,
         },
     )
-
-    training_dtype = getattr(configs, "training_dtype", None)
-    if training_dtype is None:
-        training_dtype = "bfloat16" if configs.bf16 else "float32"
-    dtype_map = {
-        "float16": torch.float16,
-        "float32": torch.float32,
-        "bfloat16": torch.bfloat16,
-    }
-    if training_dtype not in dtype_map:
-        raise ValueError(
-            "training_dtype must be float16, float32, or bfloat16"
-        )
-    model.to(dtype_map[training_dtype])
 
     uses_fsdp = world_size > 1 and not configs.only_eval
     if world_size == 1:
