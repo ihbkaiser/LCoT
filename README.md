@@ -213,6 +213,23 @@ The Llama config starts at `batch_size_training: 1` and
 `gradient_accumulation_steps: 32`. Increase the micro-batch only after the
 smoke test and an initial training step establish available VRAM headroom.
 
+### Full fine-tuning on one B200
+
+The LoRA path above is a memory-saving option, not a Coconut requirement. To
+follow the original Coconut-style full fine-tuning setup on a 1-GPU B200, use:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=1 run.py \
+  args/prosqa_finite_state_llama3.2_3b_full_b200.yaml
+```
+
+This config keeps the Llama 3.2-3B **Base** checkpoint, sets `use_lora: false`,
+trains the full pretrained model plus the finite-state modules, and uses
+BF16 with `batch_size_training: 16` and `gradient_accumulation_steps: 8`.
+If memory remains comfortably below the limit, try batch 32 and accumulation 4.
+The `peft` package is only needed for the LoRA configuration; full fine-tuning
+does not call PEFT.
+
 ### ProsQA QAT grid search
 
 The strict finite-state quantizer uses hard quantize/dequantize operations at

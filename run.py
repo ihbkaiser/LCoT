@@ -4,7 +4,12 @@
 import torch
 import torch.distributed
 import torch.optim as optim
-from peft import LoraConfig, TaskType, get_peft_model
+try:
+    from peft import LoraConfig, TaskType, get_peft_model
+except ImportError:  # PEFT is optional for full-finetuning runs.
+    LoraConfig = None
+    TaskType = None
+    get_peft_model = None
 from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 
 from stokenizer import STokenizer
@@ -50,6 +55,12 @@ MAX_GRAD_NORM = 1.0
 
 def add_pretrained_lora(model, *, train_task_interfaces=True):
     """Freeze a pretrained LM and add the trainable task interface and LoRA."""
+
+    if get_peft_model is None:
+        raise ImportError(
+            "PEFT is required when use_lora=true; install peft or set "
+            "use_lora: false for full fine-tuning."
+        )
 
     model_type = getattr(model.config, "model_type", None)
     target_modules = None
@@ -415,9 +426,12 @@ def main():
     end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
 
     pretrained_model_id = getattr(configs, "pretrained_model_id", None)
-    uses_lora = pretrained_model_id not in {None, "None", ""}
+    has_pretrained_model = pretrained_model_id not in {None, "None", ""}
+    uses_lora = bool(getattr(configs, "use_lora", has_pretrained_model))
+    if uses_lora and not has_pretrained_model:
+        raise ValueError("use_lora=true requires pretrained_model_id")
     training_dtype, training_torch_dtype = resolve_training_dtype(configs)
-    if not uses_lora:
+    if not has_pretrained_model:
         if rank == 0:
             print(
                 "Initializing causal LM from model config: "
@@ -476,6 +490,8 @@ def main():
                 "Train resized token input/output interface: "
                 f"{train_task_interfaces}"
             )
+    elif rank == 0 and has_pretrained_model:
+        print("Full fine-tuning enabled: PEFT/LoRA is disabled")
 
     resolved_config_path = os.path.join(save_dir, "model_config.json")
     if rank == 0:
