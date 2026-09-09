@@ -13,7 +13,6 @@ except ImportError:  # PEFT is optional for full-finetuning runs.
 from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
 
 from stokenizer import STokenizer
-import wandb
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -589,17 +588,6 @@ def main():
     else:
         max_new_tokens = 128
 
-    total_train_steps = 0
-
-    if not configs.debug and not configs.only_eval and rank == 0:
-        wandb_run = wandb.init(project=configs.project, name=configs.name)
-        wandb_run.config.update(configs, allow_val_change=True)
-        text_table = wandb.Table(columns=["step", "text"])
-
-    else:
-        wandb_run = None
-
-
     optimizer = create_optimizer(
         parallel_model,
         learning_rate=configs.lr,
@@ -736,35 +724,6 @@ def main():
             )
 
             for step, batch in enumerate(train_dataloader):
-
-                if step == 0 and wandb_run and rank == 0:
-                    print("logging training data")
-                    cur_bs = len(batch["input_ids"])
-                    text_str = ""
-                    for data_idx in range(cur_bs):
-                        for token_idx in range(len(batch["input_ids"][data_idx])):
-                            text_str += (
-                                str(batch["input_ids"][data_idx][token_idx].item())
-                                + " "
-                                + str(batch["attention_mask"][data_idx][token_idx].item())
-                                + " "
-                                + str(batch["labels"][data_idx][token_idx].item())
-                                + " "
-                                + tokenizer.decode(
-                                    batch["input_ids"][data_idx][token_idx]
-                                )
-                                + "\n"
-                            )
-                        text_str += "====" * 10 + "\n"
-                    text_table.add_data(total_train_steps, text_str)
-                    # copy the table due to a bug in wandb
-                    # https://github.com/wandb/wandb/issues/2981
-
-                    # wandb_run.log({"data_table": copy(text_table)})
-                    # this will produce larger and larger tables as the training progresses
-                    # so we don't log it to wandb when the epoch number is set large
-                
-                total_train_steps += 1
                 batch = {
                     key: batch[key].to(rank) for key in batch.keys() if key != "idx"
                 }
@@ -787,21 +746,6 @@ def main():
                     lr_scheduler.step()
                     optimizer.zero_grad()
                     pbar.update(1)
-
-                if wandb_run and rank == 0:
-                    log_dict = {
-                        "train/epoch": epoch + 1,
-                        "train/step": epoch * len(train_dataloader) + step,
-                        "train/loss": loss.detach().float()
-                        * configs.gradient_accumulation_steps,
-                    }
-                    if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
-                        train_dataloader
-                    ) - 1:
-                        log_dict["train/grad_norm"] = grad_norm.detach().float()
-                        for group in optimizer.param_groups:
-                            log_dict[f"train/lr_{group['name']}"] = group["lr"]
-                    wandb_run.log(log_dict)
 
                 pbar.set_description(
                     f"Training Epoch: {epoch+1}/{configs.num_epochs}, batch {step}/{len(train_dataloader)} "
@@ -849,12 +793,7 @@ def main():
                     dist.all_reduce(loss, op=dist.ReduceOp.SUM)
                     total_loss += loss.item() / world_size
 
-                if wandb_run and rank == 0:
-
-                    log_dict = {
-                        "eval/loss": total_loss / len(valid_loss_dataloader),
-                    }
-                    wandb_run.log(log_dict)
+                if rank == 0:
                     print("eval loss", total_loss / len(valid_loss_dataloader))
 
         # if scheduled_stage >= configs.max_latent_stage:
@@ -949,9 +888,6 @@ def main():
                 print(f"Accuracy on validation set: {cor} / {total} = {cor/total}")
                 # print(f"CoT match on validation set: {cor_cot} / {total} = {cor_cot/total}")
             sys.stdout.flush()
-
-            if wandb_run:
-                wandb_run.log({"eval/acc": cor / total})
 
             if configs.only_eval:
                 break
