@@ -3,7 +3,7 @@ save_path: ckpts
 name: musique-gpt2-full-finite-qcond-b256-t4-p4
 
 dataset: musique
-musique_interface: question_conditioned
+continuation_interface: question_conditioned
 only_eval: false
 coconut: true
 cot: false

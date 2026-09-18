@@ -1,8 +1,8 @@
-project: evidencegraph-qa
+project: finite-cot
 save_path: ckpts
-name: musique-gpt2-full-finite-strict-b256-t4-p4
+name: prosqa-gpt2-full-finite-strict-d64-p4
 
-dataset: musique
+dataset: prosqa
 continuation_interface: strict_continuation
 only_eval: false
 coconut: true
@@ -10,9 +10,8 @@ cot: false
 no_thoughts: false
 no_cot: false
 
-latent_steps: 4
 c_thought: 1
-epochs_per_stage: 1
+epochs_per_stage: 25
 max_latent_stage: 4
 pad_latent_to_max: true
 finite_state:
@@ -25,32 +24,24 @@ finite_state:
 
 save_only_improve: true
 save_best_only: true
-uniform_prob: 0.0
+uniform_prob: 0.1
 model_id: gpt2
 pretrained_model_id: gpt2
 use_lora: false
 tokenizer: gpt2
-require_bpe: true
 load_model_path: None
 
 seed: 17
 resume: 0
 bf16: true
-training_dtype: float32
-train_path: data/musique_ans_v1.0_train.jsonl
-val_path: data/musique_ans_v1.0_dev.jsonl
-distractors: 8
-max_paragraph_tokens: 0
-max_prefix_tokens: 896
-max_sequence_tokens: 1024
-max_answer_tokens: 64
+training_dtype: bfloat16
+train_path: data/prosqa_train_graph_4_coconut.json
+val_path: data/prosqa_valid_graph_4_coconut.json
 reset_optimizer: false
 batch_size_training: 1
 debug: false
-debug_samples: 128
-show_preprocessing_progress: true
-preprocessing_workers: 8
 gradient_accumulation_steps: 128
-num_epochs: 8
+num_epochs: 300
+max_answer_tokens: 8
 lr: 1.0e-4
 weight_decay: 0.01

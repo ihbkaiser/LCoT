@@ -5,6 +5,11 @@ data, where the finite boundary lies, and which claims each access interface can
 support. It is part of the experimental contract; the two runs below must not
 be pooled under one access label.
 
+The marker layout is produced by the shared
+`build_finite_continuation_prompt` formatter also used by strict ProsQA. The
+finite adapter itself is dataset-agnostic: loaders decide which text is
+evidence and which text is the legal continuation.
+
 ## Data used
 
 - Training reads `data/musique_ans_v1.0_train.jsonl`, the official answerable
@@ -144,4 +149,3 @@ manifest, chain-versus-branching labels, inverse-hop-frequency sampling, the
 manual 200-example audit, sealed-paragraph selection, binary/hybrid retained
 transcripts, and 2WikiMultiHopQA. Results must state these omissions rather
 than calling the current data a completed evidence-locked benchmark.
-

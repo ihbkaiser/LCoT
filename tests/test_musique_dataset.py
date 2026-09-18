@@ -10,7 +10,12 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.trainers import BpeTrainer
 from transformers import PreTrainedTokenizerFast
 
-from dataset import get_musique_dataset, validate_bpe_tokenizer
+from dataset import (
+    build_finite_continuation_prompt,
+    expand_data,
+    get_musique_dataset,
+    validate_bpe_tokenizer,
+)
 
 
 def tiny_bpe():
@@ -101,7 +106,7 @@ class MusiqueDatasetTests(unittest.TestCase):
             max_prefix_tokens=100,
             max_sequence_tokens=128,
             latent_steps=4,
-            musique_interface="question_conditioned",
+            continuation_interface="question_conditioned",
             show_preprocessing_progress=False,
         )
 
@@ -148,7 +153,7 @@ class MusiqueDatasetTests(unittest.TestCase):
         self.assertEqual(item["input_ids"][start + 1 : end].count(latent_id), 5)
 
     def test_strict_layout_places_question_after_boundary_before_updates(self):
-        self.config.musique_interface = "strict_continuation"
+        self.config.continuation_interface = "strict_continuation"
         dataset = get_musique_dataset(
             self.write_split([sample()]), self.config, self.tokenizer, "latent"
         )
@@ -164,7 +169,7 @@ class MusiqueDatasetTests(unittest.TestCase):
         self.assertEqual(ids[start + 1 : end].count(latent_id), 4)
 
     def test_strict_zero_updates_keeps_boundary_and_question(self):
-        self.config.musique_interface = "strict_continuation"
+        self.config.continuation_interface = "strict_continuation"
         self.config.latent_steps = 0
         dataset = get_musique_dataset(
             self.write_split([sample()]), self.config, self.tokenizer, "latent"
@@ -203,6 +208,75 @@ class MusiqueDatasetTests(unittest.TestCase):
         self.config.preprocessing_workers = 4
         parallel = get_musique_dataset(path, self.config, self.tokenizer, "latent")
         self.assertEqual(parallel, serial)
+
+    def test_shared_continuation_formatter_places_boundary(self):
+        strict = build_finite_continuation_prompt(
+            "EVIDENCE", " [Q] query", 2,
+            interface="strict_continuation", tail=" [A]",
+        )
+        conditioned = build_finite_continuation_prompt(
+            "EVIDENCE", " [Q] query", 3,
+            interface="question_conditioned", tail=" [A]",
+        )
+
+        self.assertEqual(
+            strict,
+            "EVIDENCE <|start-latent|> [Q] query"
+            " <|latent|> <|latent|> <|end-latent|> [A]",
+        )
+        self.assertEqual(
+            conditioned,
+            "EVIDENCE [Q] query <|start-latent|>"
+            " <|latent|> <|latent|> <|latent|> <|end-latent|> [A]",
+        )
+
+    def test_prosqa_strict_continuation_uses_edges_as_prefix(self):
+        graph = {
+            "idx_to_symbol": ["a", "b", "c"],
+            "edges": [[0, 1], [1, 2]],
+            "target": 2,
+            "neg_target": 1,
+            "root": 0,
+            "neighbor_k": {"1": [1], "2": [2]},
+        }
+        prompt, answer = expand_data(
+            graph,
+            k=3,
+            max_steps=2,
+            continuation_interface="strict_continuation",
+        )
+
+        start = prompt.index("<|start-latent|>")
+        question = prompt.index("[Q]")
+        first_latent = prompt.index("<|latent|>")
+        end = prompt.index("<|end-latent|>")
+        self.assertLess(start, question)
+        self.assertLess(question, first_latent)
+        self.assertLess(first_latent, end)
+        self.assertEqual(prompt.count("<|latent|>"), 2)
+        self.assertTrue(prompt.index("0 1") < start)
+        self.assertEqual(answer, "2")
+
+    def test_prosqa_strict_stage_zero_has_state_but_no_updates(self):
+        graph = {
+            "idx_to_symbol": ["a", "b", "c"],
+            "edges": [[0, 1], [1, 2]],
+            "target": 2,
+            "neg_target": 1,
+            "root": 0,
+            "neighbor_k": {"1": [1], "2": [2]},
+        }
+        prompt, answer = expand_data(
+            graph,
+            k=1,
+            max_steps=2,
+            continuation_interface="strict_continuation",
+        )
+
+        self.assertIn("<|start-latent|>", prompt)
+        self.assertIn("<|end-latent|>", prompt)
+        self.assertNotIn("<|latent|>", prompt)
+        self.assertEqual(answer, "1")
 
 
 if __name__ == "__main__":

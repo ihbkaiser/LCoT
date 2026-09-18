@@ -3,7 +3,7 @@ save_path: ckpts
 name: musique-gpt2-full-finite-qcond-b256-t4-p4
 
 dataset: musique
-musique_interface: question_conditioned
+continuation_interface: question_conditioned
 only_eval: false
 coconut: true
 cot: false
@@ -12,7 +12,7 @@ no_cot: false
 
 latent_steps: 4
 c_thought: 1
-epochs_per_stage: 1
+epochs_per_stage: 5
 max_latent_stage: 4
 pad_latent_to_max: true
 finite_state:
@@ -45,12 +45,12 @@ max_prefix_tokens: 896
 max_sequence_tokens: 1024
 max_answer_tokens: 64
 reset_optimizer: false
-batch_size_training: 2
+batch_size_training: 4
 debug: false
 debug_samples: 128
 show_preprocessing_progress: true
 preprocessing_workers: 8
 gradient_accumulation_steps: 8
-num_epochs: 8
+num_epochs: 50
 lr: 1.0e-4
 weight_decay: 0.01

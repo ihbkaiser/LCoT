@@ -308,6 +308,21 @@ torchrun --standalone --nnodes=1 --nproc_per_node=1 run.py \
   args/finite_cot/musique_gpt2_strict_continuation.yaml
 ```
 
+The same strict interface is available for ProsQA. Graph edges are consumed as
+the read-once prefix; `[Q]` candidate targets and `[R]` root form the shared
+post-boundary continuation used by each state update:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=1 run.py \
+  args/finite_cot/prosqa_gpt2_strict_continuation.yaml
+```
+
+Dataset loaders use the shared `build_finite_continuation_prompt` formatter.
+Future datasets only need to supply an evidence string, continuation string,
+number of updates, and answer tail to receive the same marker contract. The
+general interface and ProsQA curriculum are documented in
+[proposal/FINITE_CONTINUATION_INTERFACE.md](proposal/FINITE_CONTINUATION_INTERFACE.md).
+
 The resource-sweep launcher holds each retained budget at `B=d*p` while varying
 the configured state precision and recurrent steps. Its dry run writes
 auditable resolved configs and a JSONL manifest without starting training:

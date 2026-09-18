@@ -60,6 +60,46 @@ def _sentence_spans(text):
     return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
 
 
+def build_finite_continuation_prompt(
+    evidence,
+    continuation,
+    latent_tokens,
+    *,
+    interface,
+    tail="",
+):
+    """Format a finite-state prompt with one explicit access boundary.
+
+    Dataset loaders supply natural-language/symbolic evidence and continuation;
+    the strict adapter interprets START as the point where evidence is sealed.
+    """
+
+    if latent_tokens < 0:
+        raise ValueError("latent_tokens must be non-negative")
+    latents = " <|latent|>" * latent_tokens
+    if interface == "strict_continuation":
+        return (
+            evidence
+            + " <|start-latent|>"
+            + continuation
+            + latents
+            + " <|end-latent|>"
+            + tail
+        )
+    if interface == "question_conditioned":
+        return (
+            evidence
+            + continuation
+            + " <|start-latent|>"
+            + latents
+            + " <|end-latent|>"
+            + tail
+        )
+    raise ValueError(
+        "interface must be question_conditioned or strict_continuation"
+    )
+
+
 def _crop_musique_paragraph(paragraph, support_answers, tokenizer, max_tokens):
     """BPE-crop a paragraph around its answer-bearing evidence sentence."""
 
@@ -180,7 +220,9 @@ def get_musique_dataset(dataset_path, configs, tokenizer, mode, question_only=Fa
     max_sequence_tokens = int(getattr(configs, "max_sequence_tokens", 2304))
     recurrent_updates = int(getattr(configs, "latent_steps", 4))
     musique_interface = getattr(
-        configs, "musique_interface", "question_conditioned"
+        configs,
+        "continuation_interface",
+        getattr(configs, "musique_interface", "question_conditioned"),
     )
     if musique_interface not in {"question_conditioned", "strict_continuation"}:
         raise ValueError(
@@ -213,22 +255,23 @@ def get_musique_dataset(dataset_path, configs, tokenizer, mode, question_only=Fa
             if musique_interface == "question_conditioned":
                 # Existing sealed-prefix interface: the first latent initializes
                 # z_0 from evidence + question; the remaining T latents update it.
-                suffix = (
-                    question
-                    + " <|start-latent|>"
-                    + " <|latent|>" * (recurrent_updates + 1)
-                    + " <|end-latent|> [A]"
+                prompt = build_finite_continuation_prompt(
+                    evidence,
+                    question,
+                    recurrent_updates + 1,
+                    interface=musique_interface,
+                    tail=" [A]",
                 )
             else:
                 # Strict continuation interface: initialize z_0 from evidence at
                 # the boundary, then let exactly T updates read the question.
-                suffix = (
-                    " <|start-latent|>"
-                    + question
-                    + " <|latent|>" * recurrent_updates
-                    + " <|end-latent|> [A]"
+                prompt = build_finite_continuation_prompt(
+                    evidence,
+                    question,
+                    recurrent_updates,
+                    interface=musique_interface,
+                    tail=" [A]",
                 )
-            prompt = evidence + suffix
             continuation = f" {answer} <eos>"
         else:
             raise ValueError(f"unknown MuSiQue mode: {mode}")
@@ -239,13 +282,14 @@ def get_musique_dataset(dataset_path, configs, tokenizer, mode, question_only=Fa
             # Evidence is first and gold passages precede distractors. Preserve
             # the complete question, boundary, latent markers, and answer prompt.
             if mode == "latent":
-                suffix_ids = _encode(tokenizer, suffix)
+                evidence_ids = _encode(tokenizer, evidence)
+                suffix_ids = prompt_ids[len(evidence_ids) :]
                 evidence_budget = (
                     max_sequence_tokens - len(suffix_ids) - len(continuation_ids)
                 )
                 if evidence_budget < 1:
                     return None
-                prompt_ids = _encode(tokenizer, evidence)[:evidence_budget] + suffix_ids
+                prompt_ids = evidence_ids[:evidence_budget] + suffix_ids
             else:
                 prompt_ids = prompt_ids[: max_sequence_tokens - len(continuation_ids)]
         tokens = prompt_ids + continuation_ids
@@ -401,7 +445,13 @@ class MyCollator:
         return batch
 
 
-def expand_data(data, k, max_steps, neg_sampling=False):
+def expand_data(
+    data,
+    k,
+    max_steps,
+    neg_sampling=False,
+    continuation_interface="legacy",
+):
     
     assert k <= max_steps + 1
     # k = 1, 2, 3, 4, 5
@@ -410,21 +460,30 @@ def expand_data(data, k, max_steps, neg_sampling=False):
     for i, s in enumerate(data['idx_to_symbol']):
         symbol_to_idx[s] = i
     
-    def get_prefix(data):
+    def get_prompt(latent_tokens, *, answer_marker=False):
         
         random.shuffle(data['edges'])
 
-        question = "<eos> " + "|".join([f" {e[0]} {e[1]} " for e in data['edges']]).strip() + \
-            " [Q] "
+        evidence = "<eos> " + "|".join(
+            [f" {e[0]} {e[1]} " for e in data['edges']]
+        ).strip()
 
         if random.random() < 0.5:
-            question += str(data['target']) + " " + str(data['neg_target'])
+            candidates = str(data['target']) + " " + str(data['neg_target'])
         else:
-            question += str(data['neg_target']) + " " + str(data['target'])
+            candidates = str(data['neg_target']) + " " + str(data['target'])
 
-        question += " [R] " + str(data['root'])
-        
-        return question
+        continuation = " [Q] " + candidates + " [R] " + str(data['root'])
+        tail = " [A] " if answer_marker else " "
+        if continuation_interface == "legacy":
+            return evidence + continuation + " <|latent|>" * latent_tokens + tail
+        return build_finite_continuation_prompt(
+            evidence,
+            continuation,
+            latent_tokens,
+            interface=continuation_interface,
+            tail=tail,
+        )
 
 
     # return_data = None
@@ -432,18 +491,18 @@ def expand_data(data, k, max_steps, neg_sampling=False):
         # for n in data["neighbor_k"][str(k)]:
         if neg_sampling:
             if random.random() < 0.2:
-                question = get_prefix(data) + " <|latent|>" * (k-1) + " [A] "
+                question = get_prompt(k - 1, answer_marker=True)
                 continuation = "<|no-answer|>"
                 return_data = (question, continuation)
         
             else:
                 n = random.choice(data["neighbor_k"][str(k)])
-                question = get_prefix(data) + " <|latent|>" * (k-1) + " "
+                question = get_prompt(k - 1)
                 continuation = str(n)
                 return_data = (question, continuation)
         else:
             n = random.choice(data["neighbor_k"][str(k)])
-            question = get_prefix(data) + " <|latent|>" * (k-1) + " "
+            question = get_prompt(k - 1)
             continuation = str(n)
             return_data = (question, continuation)
 
@@ -451,15 +510,17 @@ def expand_data(data, k, max_steps, neg_sampling=False):
     elif k == max_steps + 1:
         if neg_sampling:
             if random.random() < 0.2:
-                question = get_prefix(data) + " <|latent|>" * random.randint(0, max_steps - 1) + " [A] "
+                question = get_prompt(
+                    random.randint(0, max_steps - 1), answer_marker=True
+                )
                 continuation = "<|no-answer|>"
                 return_data = (question, continuation)
             else:
-                question = get_prefix(data) + " <|latent|>" * max_steps + " [A] "
+                question = get_prompt(max_steps, answer_marker=True)
                 continuation = str(data["target"])
                 return_data = (question, continuation)
         else:
-            question = get_prefix(data) + " <|latent|>" * max_steps + " [A] "
+            question = get_prompt(max_steps, answer_marker=True)
             continuation = str(data["target"])
             return_data = (question, continuation)
     
@@ -498,7 +559,14 @@ def get_graph_latent_cot_dataset(
         # this range is [0, ..., len(sample["steps"])]
         # including both ends
 
-        expanded_data = expand_data(sample, scheduled_stage_to_train + 1, len(sample["steps"]))
+        expanded_data = expand_data(
+            sample,
+            scheduled_stage_to_train + 1,
+            len(sample["steps"]),
+            continuation_interface=getattr(
+                configs, "continuation_interface", "legacy"
+            ),
+        )
         
         # Process each question-continuation pair
         processed_samples = []
@@ -559,7 +627,15 @@ def get_graph_latent_question_dataset(
     # without the continuation
     
     def process_dataset(sample, idx):
-        expanded_data = expand_data(sample, len(sample["steps"]) + 1, len(sample["steps"]), neg_sampling=False)
+        expanded_data = expand_data(
+            sample,
+            len(sample["steps"]) + 1,
+            len(sample["steps"]),
+            neg_sampling=False,
+            continuation_interface=getattr(
+                configs, "continuation_interface", "legacy"
+            ),
+        )
         processed_samples = []
         for question, continuation in [expanded_data]:
             question_tokenized = tokenizer.encode(question, add_special_tokens=False)
