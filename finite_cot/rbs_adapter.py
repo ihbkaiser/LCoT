@@ -98,6 +98,43 @@ class StrictFiniteStateCoconut(nn.Module):
             **kwargs,
         )
 
+    def _hidden_backbone(self):
+        """Return GPT-2's transformer without its expensive vocabulary head."""
+
+        model = self.base_causallm
+        get_base_model = getattr(model, "get_base_model", None)
+        if callable(get_base_model):
+            model = get_base_model()
+        if (
+            getattr(model.config, "model_type", None) == "gpt2"
+            and hasattr(model, "transformer")
+        ):
+            return model.transformer
+        return None
+
+    def _hidden(self, embeds: Tensor, attention_mask: Tensor | None = None) -> Tensor:
+        """Compute hidden states without projecting every token over the vocabulary.
+
+        GPT-2's causal-LM wrapper always materializes full-vocabulary logits. State
+        construction only needs transformer activations, so doing that projection
+        for an 896-token evidence prefix is pure compute and memory overhead.
+        """
+
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                embeds.shape[:2], dtype=torch.long, device=embeds.device
+            )
+        backbone = self._hidden_backbone()
+        if backbone is not None:
+            self.gen_forward_cnt += 1
+            return backbone(
+                inputs_embeds=embeds,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            ).last_hidden_state
+        return self._base(embeds, hidden=True).hidden_states[-1]
+
     def _batched_last_hidden(self, sequences: List[Tensor]) -> Tensor:
         """Run one padded LM batch and select each sequence's last hidden state."""
 
@@ -109,19 +146,9 @@ class StrictFiniteStateCoconut(nn.Module):
         padded = pad_sequence(sequences, batch_first=True)
         positions = torch.arange(padded.shape[1], device=padded.device)
         attention_mask = positions.unsqueeze(0) < lengths.unsqueeze(1)
-        self.gen_forward_cnt += 1
-        kwargs = {}
-        if getattr(self.base_causallm.config, "model_type", None) == "qwen3":
-            kwargs["logits_to_keep"] = 1
-        outputs = self.base_causallm(
-            inputs_embeds=padded,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_hidden_states=True,
-            **kwargs,
-        )
+        outputs = self._hidden(padded, attention_mask)
         batch_indices = torch.arange(len(sequences), device=padded.device)
-        return outputs.hidden_states[-1][batch_indices, lengths - 1]
+        return outputs[batch_indices, lengths - 1]
 
     def _trim_example(
         self, input_ids: Tensor, attention_mask: Tensor, labels: Tensor | None
@@ -171,9 +198,7 @@ class StrictFiniteStateCoconut(nn.Module):
         tail_ids = ids[end + 1 :]
 
         evidence_embeds = self.embedding(evidence_ids).unsqueeze(0)
-        initial_hidden = self._base(evidence_embeds, hidden=True).hidden_states[-1][
-            :, -1, :
-        ]
+        initial_hidden = self._hidden(evidence_embeds)[:, -1, :]
         state_q = self.bottleneck.compress(initial_hidden)
         state = state_q.value
         codes = [state_q.codes]
@@ -184,9 +209,7 @@ class StrictFiniteStateCoconut(nn.Module):
                 (continuation_embeds, self.bottleneck.expand(state).unsqueeze(1)),
                 dim=1,
             )
-            updated_hidden = self._base(update_input, hidden=True).hidden_states[-1][
-                :, -1, :
-            ]
+            updated_hidden = self._hidden(update_input)[:, -1, :]
             state_q = self.bottleneck.compress(updated_hidden)
             state = state_q.value
             codes.append(state_q.codes)
@@ -218,19 +241,115 @@ class StrictFiniteStateCoconut(nn.Module):
         return effective, codes, effective_labels
 
     def _strict_forward(self, input_ids, attention_mask, labels) -> Outputs:
-        effective_sequences = []
-        effective_labels = []
-        all_codes = []
+        evidence_sequences = []
+        continuation_sequences = []
+        tail_sequences = []
+        mapped_labels = []
+        latent_counts = []
         for index in range(input_ids.shape[0]):
             ids, kept_labels = self._trim_example(
                 input_ids[index],
                 attention_mask[index],
                 labels[index] if labels is not None else None,
             )
-            effective, codes, mapped_labels = self._strict_context(ids, kept_labels)
-            effective_sequences.append(effective.squeeze(0))
-            effective_labels.append(mapped_labels)
-            all_codes.append(codes)
+
+            start_positions = (ids == self.start_latent_id).nonzero(
+                as_tuple=False
+            ).view(-1)
+            end_positions = (ids == self.end_latent_id).nonzero(
+                as_tuple=False
+            ).view(-1)
+            if start_positions.numel() != 1 or end_positions.numel() != 1:
+                raise ValueError(
+                    "strict_read_once requires exactly one start and one end marker"
+                )
+            start = int(start_positions[0])
+            end = int(end_positions[0])
+            if start == 0 or start >= end:
+                raise ValueError(
+                    "strict_read_once requires evidence before the boundary"
+                )
+
+            latent_positions = (ids == self.latent_token_id).nonzero(
+                as_tuple=False
+            ).view(-1)
+            if latent_positions.numel() and not bool(
+                ((latent_positions > start) & (latent_positions < end)).all()
+            ):
+                raise ValueError(
+                    "all strict latent markers must lie inside the boundary"
+                )
+            first_latent = (
+                int(latent_positions[0]) if latent_positions.numel() else end
+            )
+            continuation_ids = ids[start + 1 : first_latent]
+            if continuation_ids.numel() == 0:
+                raise ValueError(
+                    "strict_read_once requires a post-boundary continuation"
+                )
+
+            evidence_sequences.append(self.embedding(ids[:start]))
+            continuation_sequences.append(self.embedding(continuation_ids))
+            tail_sequences.append(self.embedding(ids[end + 1 :]))
+            latent_counts.append(int(latent_positions.numel()))
+            if kept_labels is not None:
+                mapped_labels.append(
+                    torch.cat(
+                        (
+                            kept_labels[start + 1 : first_latent],
+                            kept_labels.new_full((1,), -100),
+                            kept_labels[end + 1 :],
+                        )
+                    )
+                )
+
+        # One transformer call handles all evidence prefixes in the batch. The
+        # evidence activations are not placed in the decoder context or retained
+        # between recurrent updates; only the quantized state survives.
+        initial_state = self.bottleneck.compress(
+            self._batched_last_hidden(evidence_sequences)
+        )
+        states: List[Tensor] = [
+            initial_state.value[index] for index in range(input_ids.shape[0])
+        ]
+        all_codes: List[List[Tensor]] = [
+            [initial_state.codes[index]] for index in range(input_ids.shape[0])
+        ]
+
+        for update_index in range(max(latent_counts, default=0)):
+            active = [
+                index
+                for index, count in enumerate(latent_counts)
+                if count > update_index
+            ]
+            update_hidden = self._batched_last_hidden(
+                [
+                    torch.cat(
+                        (
+                            continuation_sequences[index],
+                            self.bottleneck.expand(states[index]).unsqueeze(0),
+                        ),
+                        dim=0,
+                    )
+                    for index in active
+                ]
+            )
+            updated_state = self.bottleneck.compress(update_hidden)
+            for row, index in enumerate(active):
+                states[index] = updated_state.value[row]
+                all_codes[index].append(updated_state.codes[row])
+
+        effective_sequences = [
+            torch.cat(
+                (
+                    continuation_sequences[index],
+                    self.bottleneck.expand(states[index]).unsqueeze(0),
+                    tail_sequences[index],
+                ),
+                dim=0,
+            )
+            for index in range(input_ids.shape[0])
+        ]
 
         lengths = torch.tensor(
             [sequence.shape[0] for sequence in effective_sequences],
@@ -251,7 +370,7 @@ class StrictFiniteStateCoconut(nn.Module):
             loss = outputs.logits.sum() * 0.0
         else:
             mapped = pad_sequence(
-                effective_labels, batch_first=True, padding_value=-100
+                mapped_labels, batch_first=True, padding_value=-100
             )
             loss = F.cross_entropy(
                 outputs.logits[:, :-1].flatten(0, 1),
@@ -261,6 +380,18 @@ class StrictFiniteStateCoconut(nn.Module):
         self.last_state_codes = [
             [code.detach() for code in trace] for trace in all_codes
         ]
+        self.last_ledger = ResourceLedger(
+            state_dim=self.bottleneck.state_dim,
+            bits_per_coordinate=self.bottleneck.bits,
+            recurrent_updates=max(latent_counts, default=0),
+            access_model=self.access_mode,
+            input_reads=1,
+            retains_latent_history=False,
+            notes=(
+                "evidence read once; every update sees only the shared "
+                "continuation and current hard code; no evidence past_key_values"
+            ),
+        )
         return Outputs(loss=loss, inputs_embeds=effective, logits=outputs.logits)
 
     def _finite_context(
@@ -280,8 +411,8 @@ class StrictFiniteStateCoconut(nn.Module):
             raise ValueError("a finite-state sequence must have a non-empty prefix")
         prefix_embeds = self.embedding(prefix_ids).unsqueeze(0)
 
-        encoded = self._base(prefix_embeds, hidden=True)
-        state_q = self.bottleneck.compress(encoded.hidden_states[-1][:, -1, :])
+        encoded = self._hidden(prefix_embeds)
+        state_q = self.bottleneck.compress(encoded[:, -1, :])
         state = state_q.value
         codes = [state_q.codes]
         num_latents = int(latent_positions.numel())
@@ -290,9 +421,7 @@ class StrictFiniteStateCoconut(nn.Module):
                 update_input = torch.cat(
                     (prefix_embeds, self.bottleneck.expand(state).unsqueeze(1)), dim=1
                 )
-                updated = self._base(update_input, hidden=True).hidden_states[-1][
-                    :, -1, :
-                ]
+                updated = self._hidden(update_input)[:, -1, :]
                 state_q = self.bottleneck.compress(updated)
             else:
                 state_q = self.bottleneck.quantizer.quantize(

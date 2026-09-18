@@ -238,7 +238,9 @@ class RunLoraTests(unittest.TestCase):
                 expected_losses.append(loss)
 
         calls = []
-        hook = model.base_causallm.register_forward_hook(
+        # Hidden-state passes bypass GPT2LMHeadModel's vocabulary projection,
+        # so count transformer calls rather than causal-LM wrapper calls.
+        hook = model.base_causallm.transformer.register_forward_hook(
             lambda *unused: calls.append(1)
         )
         try:
@@ -316,6 +318,41 @@ class RunLoraTests(unittest.TestCase):
         self.assertEqual(len(codes), 1)
         self.assertEqual(effective.shape, (1, 5, 16))
         self.assertEqual(model.last_ledger.recurrent_updates, 0)
+
+    def test_strict_read_once_batches_state_construction(self):
+        model = StrictFiniteStateCoconut(
+            tiny_gpt2(), 33, 31, 32, 38, strict_config()
+        )
+        model.eval()
+        input_ids = torch.tensor(
+            [
+                [35, 1, 31, 36, 2, 33, 33, 32, 37, 5],
+                [35, 3, 31, 36, 4, 33, 33, 32, 37, 6],
+            ]
+        )
+        labels = torch.full_like(input_ids, -100)
+        labels[:, -1] = input_ids[:, -1]
+
+        calls = []
+        hook = model.base_causallm.transformer.register_forward_hook(
+            lambda *unused: calls.append(1)
+        )
+        try:
+            with torch.no_grad():
+                output = model(
+                    input_ids=input_ids,
+                    attention_mask=torch.ones_like(input_ids),
+                    labels=labels,
+                )
+        finally:
+            hook.remove()
+
+        self.assertTrue(torch.isfinite(output.loss))
+        self.assertEqual(len(model.last_state_codes), 2)
+        self.assertTrue(all(len(trace) == 3 for trace in model.last_state_codes))
+        # z_0, two recurrent updates, and one answer-decoder call, regardless
+        # of the number of examples in the batch.
+        self.assertEqual(len(calls), 4)
 
     def test_strict_full_finetuning_preserves_base_gradients(self):
         model = StrictFiniteStateCoconut(

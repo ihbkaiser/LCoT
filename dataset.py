@@ -172,6 +172,8 @@ def _musique_parts(sample, tokenizer, configs):
         if paragraph["idx"] not in support_by_idx
     ][:distractor_count]
     paragraph_cap = int(getattr(configs, "max_paragraph_tokens", 112))
+    if paragraph_cap < 1:
+        raise ValueError("max_paragraph_tokens must be at least 1")
     gold_text = [
         _crop_musique_paragraph(
             paragraph, support_by_idx[paragraph["idx"]], tokenizer, paragraph_cap
@@ -219,6 +221,12 @@ def get_musique_dataset(dataset_path, configs, tokenizer, mode, question_only=Fa
         base_dataset = base_dataset[: int(getattr(configs, "debug_samples", 128))]
     max_sequence_tokens = int(getattr(configs, "max_sequence_tokens", 2304))
     recurrent_updates = int(getattr(configs, "latent_steps", 4))
+    if int(getattr(configs, "max_paragraph_tokens", 112)) < 1:
+        raise ValueError("max_paragraph_tokens must be at least 1")
+    if int(getattr(configs, "max_prefix_tokens", 2048)) < 1:
+        raise ValueError("max_prefix_tokens must be at least 1")
+    if max_sequence_tokens < 1:
+        raise ValueError("max_sequence_tokens must be at least 1")
     musique_interface = getattr(
         configs,
         "continuation_interface",
@@ -345,6 +353,17 @@ class MyCollator:
     def __call__(self, features, return_tensors=None):
 
         assert self.tokenizer.padding_side == "right"
+
+        # DataLoader receives references to the cached in-memory examples.
+        # Alignment padding below must not accumulate on those examples across
+        # batches or epochs, especially now that strict training uses batch > 1.
+        features = [
+            {
+                key: value.copy() if isinstance(value, list) else value
+                for key, value in feature.items()
+            }
+            for feature in features
+        ]
 
         """
         Pad the batch like this to maximize the reuse of kv cache.

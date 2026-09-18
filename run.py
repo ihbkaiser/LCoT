@@ -188,10 +188,15 @@ def optimizer_parameter_groups(
 
 
 def create_optimizer(model, learning_rate, weight_decay):
-    return optim.AdamW(
-        optimizer_parameter_groups(model, learning_rate),
-        weight_decay=weight_decay,
+    groups = optimizer_parameter_groups(model, learning_rate)
+    # Fused AdamW substantially reduces optimizer overhead for full-model GPT-2
+    # training. Keep the CPU/test path on the portable implementation.
+    use_fused = torch.cuda.is_available() and any(
+        parameter.is_cuda
+        for group in groups
+        for parameter in group["params"]
     )
+    return optim.AdamW(groups, weight_decay=weight_decay, fused=use_fused)
 
 
 def create_lr_scheduler(optimizer, num_training_steps, warmup_ratio=WARMUP_RATIO):
@@ -563,6 +568,13 @@ def main():
     best_stage_acc = {}
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
+    dataloader_workers = int(getattr(configs, "dataloader_workers", 0))
+    dataloader_kwargs = {
+        "num_workers": dataloader_workers,
+        "pin_memory": True,
+    }
+    if dataloader_workers > 0:
+        dataloader_kwargs["persistent_workers"] = True
 
     # MuSiQue tokenization is deterministic and independent of curriculum
     # epoch. Construct it once; rebuilding train and dev three times per epoch
@@ -617,11 +629,10 @@ def main():
 
             valid_gen_dataloader = torch.utils.data.DataLoader(
                 dataset_gen_val,
-                num_workers=1,
-                pin_memory=True,
                 batch_size=1,
                 collate_fn=collator,
                 sampler=DistributedSampler(dataset_gen_val, shuffle=False),
+                **dataloader_kwargs,
             )
 
         if not configs.only_eval:
@@ -649,12 +660,11 @@ def main():
                 )
             train_dataloader = torch.utils.data.DataLoader(
                 dataset_train,
-                num_workers=1,
                 shuffle=False,
-                pin_memory=True,
                 batch_size=configs.batch_size_training,
                 collate_fn=collator,
                 sampler=DistributedSampler(dataset_train, shuffle=True),
+                **dataloader_kwargs,
             )
 
             # the sampler is deterministic even if shuffle is set to True
@@ -683,12 +693,11 @@ def main():
 
             valid_loss_dataloader = torch.utils.data.DataLoader(
                 dataset_loss_val,
-                num_workers=1,
                 shuffle=False,
-                pin_memory=True,
                 batch_size=configs.batch_size_training,
                 collate_fn=collator,
                 sampler=DistributedSampler(dataset_loss_val, shuffle=False),
+                **dataloader_kwargs,
             )
 
             if configs.reset_optimizer and scheduled_stage < configs.max_latent_stage:
@@ -751,7 +760,9 @@ def main():
                 
                 total_train_steps += 1
                 batch = {
-                    key: batch[key].to(rank) for key in batch.keys() if key != "idx"
+                    key: batch[key].to(rank, non_blocking=True)
+                    for key in batch.keys()
+                    if key != "idx"
                 }
 
                 outputs = parallel_model(**batch)
@@ -770,7 +781,7 @@ def main():
                         )
                     optimizer.step()
                     lr_scheduler.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     pbar.update(1)
 
                 if wandb_run and rank == 0:
@@ -826,7 +837,9 @@ def main():
                 for step, batch in enumerate(valid_loss_dataloader):
 
                     batch = {
-                        key: batch[key].to(rank) for key in batch.keys() if key != "idx"
+                        key: batch[key].to(rank, non_blocking=True)
+                        for key in batch.keys()
+                        if key != "idx"
                     }
 
                     outputs = parallel_model(**batch)
