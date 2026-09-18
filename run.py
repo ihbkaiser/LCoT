@@ -263,6 +263,19 @@ def stage_checkpoint_path(save_dir, stage):
     return os.path.join(save_dir, f"best_stage_{stage}.pt")
 
 
+def should_evaluate_epoch(epoch, num_epochs, every_n_epochs, *, only_eval=False):
+    """Evaluate periodically and always evaluate the final training epoch."""
+
+    if every_n_epochs <= 0:
+        raise ValueError("eval_every_n_epochs must be a positive integer")
+    epoch_number = epoch + 1
+    return (
+        only_eval
+        or epoch_number % every_n_epochs == 0
+        or epoch_number == num_epochs
+    )
+
+
 def unwrap_parallel_model(model):
     """Return the underlying model for plain, DDP, and FSDP execution."""
 
@@ -307,6 +320,11 @@ def main():
     configs = Config(config_dict)
     configs.save_best_only = getattr(configs, "save_best_only", False)
     configs.save_only_improve = getattr(configs, "save_only_improve", False)
+    configs.eval_every_n_epochs = int(
+        getattr(configs, "eval_every_n_epochs", 5)
+    )
+    if configs.eval_every_n_epochs <= 0:
+        raise ValueError("eval_every_n_epochs must be a positive integer")
     set_seed(configs.seed)
     save_dir = os.path.join(configs.save_path, configs.name)
 
@@ -604,13 +622,19 @@ def main():
             )
 
     for epoch in range(configs.resume, configs.num_epochs):
-        
+        should_eval = should_evaluate_epoch(
+            epoch,
+            configs.num_epochs,
+            configs.eval_every_n_epochs,
+            only_eval=configs.only_eval,
+        )
+
         scheduled_stage = (
             0 if (configs.cot or configs.no_cot) else epoch // configs.epochs_per_stage
         )
         print("scheduled_stage", scheduled_stage)
-        
-        if True:
+
+        if should_eval:
             if dataset_name == "musique":
                 dataset_gen_val = musique_datasets["generation"]
             elif configs.cot or configs.no_cot:
@@ -667,38 +691,38 @@ def main():
                 **dataloader_kwargs,
             )
 
-            # the sampler is deterministic even if shuffle is set to True
-            # so we have shuffled the dataset when it's constructed (at every epoch).
-            if dataset_name == "musique":
-                dataset_loss_val = musique_datasets["validation"]
-            elif configs.cot:
-                dataset_loss_val = get_graph_cot_dataset(
-                    configs.val_path,
-                    configs,
-                    tokenizer,
-                )
-            elif configs.no_cot:
-                dataset_loss_val = get_graph_no_cot_dataset(
-                    configs.val_path,
-                    configs,
-                    tokenizer,
-                )
-            else:
-                dataset_loss_val = get_graph_latent_cot_dataset(
-                    configs.val_path,
-                    scheduled_stage,
-                    configs,
-                    tokenizer,
-                )
+            # Build validation inputs only on epochs where validation will run.
+            if should_eval:
+                if dataset_name == "musique":
+                    dataset_loss_val = musique_datasets["validation"]
+                elif configs.cot:
+                    dataset_loss_val = get_graph_cot_dataset(
+                        configs.val_path,
+                        configs,
+                        tokenizer,
+                    )
+                elif configs.no_cot:
+                    dataset_loss_val = get_graph_no_cot_dataset(
+                        configs.val_path,
+                        configs,
+                        tokenizer,
+                    )
+                else:
+                    dataset_loss_val = get_graph_latent_cot_dataset(
+                        configs.val_path,
+                        scheduled_stage,
+                        configs,
+                        tokenizer,
+                    )
 
-            valid_loss_dataloader = torch.utils.data.DataLoader(
-                dataset_loss_val,
-                shuffle=False,
-                batch_size=configs.batch_size_training,
-                collate_fn=collator,
-                sampler=DistributedSampler(dataset_loss_val, shuffle=False),
-                **dataloader_kwargs,
-            )
+                valid_loss_dataloader = torch.utils.data.DataLoader(
+                    dataset_loss_val,
+                    shuffle=False,
+                    batch_size=configs.batch_size_training,
+                    collate_fn=collator,
+                    sampler=DistributedSampler(dataset_loss_val, shuffle=False),
+                    **dataloader_kwargs,
+                )
 
             if configs.reset_optimizer and scheduled_stage < configs.max_latent_stage:
                 del optimizer
@@ -829,34 +853,35 @@ def main():
                 gc.collect()
                 torch.cuda.empty_cache()
 
-            # val loss
-            total_loss = 0
+            if should_eval:
+                # Validation loss follows the same cadence as generation accuracy.
+                total_loss = 0
 
-            with torch.no_grad():
-                unwrap_parallel_model(parallel_model).eval()
-                for step, batch in enumerate(valid_loss_dataloader):
+                with torch.no_grad():
+                    unwrap_parallel_model(parallel_model).eval()
+                    for step, batch in enumerate(valid_loss_dataloader):
 
-                    batch = {
-                        key: batch[key].to(rank, non_blocking=True)
-                        for key in batch.keys()
-                        if key != "idx"
-                    }
+                        batch = {
+                            key: batch[key].to(rank, non_blocking=True)
+                            for key in batch.keys()
+                            if key != "idx"
+                        }
 
-                    outputs = parallel_model(**batch)
-                    loss = outputs.loss
-                    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                    total_loss += loss.item() / world_size
+                        outputs = parallel_model(**batch)
+                        loss = outputs.loss
+                        dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+                        total_loss += loss.item() / world_size
 
-                if wandb_run and rank == 0:
+                    if wandb_run and rank == 0:
 
-                    log_dict = {
-                        "eval/loss": total_loss / len(valid_loss_dataloader),
-                    }
-                    wandb_run.log(log_dict)
-                    print("eval loss", total_loss / len(valid_loss_dataloader))
+                        log_dict = {
+                            "eval/loss": total_loss / len(valid_loss_dataloader),
+                        }
+                        wandb_run.log(log_dict)
+                        print("eval loss", total_loss / len(valid_loss_dataloader))
 
         # if scheduled_stage >= configs.max_latent_stage:
-        if True:
+        if should_eval:
             # val generation accuracy
             total_length = len(valid_gen_dataloader)
 

@@ -14,6 +14,7 @@ from run import (
     create_optimizer,
     create_lr_scheduler,
     load_training_checkpoint,
+    should_evaluate_epoch,
     trainable_state_dict,
 )
 
@@ -71,6 +72,21 @@ def strict_config():
 
 
 class RunLoraTests(unittest.TestCase):
+    def test_evaluation_runs_every_five_epochs_and_on_final_epoch(self):
+        evaluated = [
+            epoch + 1
+            for epoch in range(12)
+            if should_evaluate_epoch(epoch, 12, 5)
+        ]
+        self.assertEqual(evaluated, [5, 10, 12])
+
+    def test_only_eval_runs_immediately(self):
+        self.assertTrue(should_evaluate_epoch(0, 300, 5, only_eval=True))
+
+    def test_evaluation_interval_must_be_positive(self):
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            should_evaluate_epoch(0, 10, 0)
+
     def test_scheduler_linearly_warms_up_then_cosine_decays(self):
         parameter = torch.nn.Parameter(torch.ones(()))
         optimizer = torch.optim.AdamW([parameter], lr=1e-4)
