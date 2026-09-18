@@ -27,6 +27,35 @@ latent-only, transcript-only, and hybrid settings. Run `model: unquantized` and
 `model: prefix_reread` only as controls; their ledgers explicitly mark them as
 outside the finite-state bound.
 
+### Graph reachability (Boolean BFS)
+
+`boolean_bfs` checks the Boolean recurrence that retains every vertex reachable
+from a source within the current update depth. The deterministic mechanism
+check compares it with an independent, queue-based, limited-depth BFS on the
+full 81-configuration grid used in the paper:
+
+- graph sizes: `32`, `64`, and `128`;
+- directed-edge probabilities: `0.02`, `0.05`, and `0.10`;
+- propagation depths: `4`, `8`, and `16`;
+- random seeds: `17`, `42`, and `137`.
+
+The current check obtains exact agreement in all `81/81` configurations and on
+all `6,048/6,048` vertex-level reachability decisions, giving decision accuracy
+`1.0` and full reachable-vector agreement `1.0`. When a mismatch occurs, the
+JSON output records its graph size, edge probability, depth, seed, and number
+of mismatched vertices.
+
+The regression test also uses small directed graphs to catch errors that random
+graphs can hide: reversed adjacency orientation, off-by-one propagation,
+failure to retain previously reached vertices, incorrect handling of cycles or
+disconnected vertices, and incorrect batching of graphs and sources.
+
+```bash
+python experiments/run_mechanism_checks.py \
+  --output results/finite_cot/mechanism_checks.json
+python -m unittest discover -s tests -p 'test_boolean_bfs.py' -v
+```
+
 ### Pointer chasing
 
 `LearnedPointerMachine` carries a hard `d`-coordinate, `p`-bit state and may
@@ -44,14 +73,67 @@ evidence.
 
 ### Rare witness
 
-The full hypercube aggregator reads every marker and reports `K*d` scalar work.
-The sampled comparator can observe only explicitly inspected branches. The
-normalized aggregator separately sweeps fixed-point fractional resolution.
+The rare-witness experiment separates three mechanisms. Uniform sampling can
+observe only explicitly inspected markers; exhaustive scan reads all `K`
+markers; and hypercube aggregation reads all markers, performs `K*d` scalar
+aggregation work, and retains the witness identity in `d = log2(K)`
+coordinates.
+
+The sampling curve uses `K = 16, 64, 256, 1024` and budgets
+`r = 0, 1, K/4, K/2, K, 2K, 4K`. For each `K`, 5,000 independent instances
+share one sampled sequence up to `4K`, so smaller budgets are paired prefixes.
+The report includes Wilson 95% binomial intervals and the exact probability
+`1 - (1 - 1/K)^r`. With seed 17, the mean absolute error is `0.00341`, the
+maximum is `0.01208`, and the largest standardized error is `2.04`.
+
+Construction correctness is checked exhaustively at every witness position for
+`K = 16, 64, 256, 1024, 4096`, together with `NULL` inputs and bounded
+perturbations below `1/2`. A separate ties-to-even fixed-point sweep compares
+the unnormalized state `c_J` with `c_J/K` at
+`q - log2(K) = -2, -1, 0, 1`. The unnormalized state remains exact throughout;
+the normalized state is erased for offsets `-2` and `-1` and becomes exact at
+offsets `0` and `1`. This is a fixed-point resolution result, not a universal
+coordinate-storage lower bound.
+
+| Procedure | Charged branch reads | Additional work |
+|-----------|---------------------:|-----------------|
+| Uniform sampling | `r` | sample generation, marker checks, and decoding |
+| Exhaustive scan | `K` | marker checks and witness recording |
+| Hypercube aggregation | `K` | `K*d` scalar aggregation operations |
+
+![Rare-witness sampling coverage and fixed-point decoding](rare_witness.png)
+
+The left panel plots the probability that uniform sampling finds the unique
+witness against the normalized inspection budget `r/K`. Points are empirical
+results for the four candidate counts and vertical bars are Wilson 95%
+binomial confidence intervals. The matching solid curves are the exact
+finite-`K` probabilities `1 - (1 - 1/K)^r`. Plotting against `r/K` makes the
+inverse-mass scaling visible: the curves nearly coincide, reaching about
+`0.221` at `r = K/4`, `0.393` at `r = K/2`, `0.632` at `r = K`, `0.865` at
+`r = 2K`, and `0.982` at `r = 4K`. Thus a constant probability of finding a
+uniformly hidden witness requires a sampling budget proportional to `K`.
+
+The right panel plots exact identity-decoding accuracy against the precision
+offset `q - log2(K)`. The unnormalized aggregate has coordinates `+1` or `-1`
+and remains exactly decodable at every tested precision. Normalization reduces
+their magnitude to `1/K`: at offsets `-2` and `-1` they round to zero, so the
+decoder returns `NULL`; at `q = log2(K)` the values become exactly
+representable and accuracy jumps to `1.0`. In particular, the failure at
+offset `-1` is the specified ties-to-even midpoint behavior.
+
+Together, the panels separate three claims. Sampling needs order-`K` marker
+reads for constant coverage; the `d`-coordinate hypercube state can identify
+one of `2^d` witnesses after full aggregation; and an averaged state needs
+enough fixed-point resolution to preserve its `1/K` signal. The figure does
+not demonstrate learned reasoning or a universal storage-bit lower bound, and
+direct aggregation still reads all `K` markers and performs `K*d` scalar work.
 
 ```bash
-python experiments/run_finite_cot.py args/finite_cot/rare_witness.yaml
-python experiments/run_mechanism_checks.py \
-  --output results/finite_cot/mechanism_checks.json
+python experiments/run_finite_cot.py args/finite_cot/rare_witness.yaml \
+  --output results/finite_cot/rare_witness.json
+python experiments/plot_rare_witness.py results/finite_cot/rare_witness.json \
+  --output rare_witness.png
+python -m unittest discover -s tests -p 'test_rare_witness.py' -v
 ```
 
 ## Strict ProsQA adapter
@@ -199,6 +281,40 @@ are resumed by `run.py`.
 ```bash
 python -m unittest discover -s tests -v
 python experiments/run_mechanism_checks.py
+```
+
+The mechanism-check output distinguishes vertex-level `decision_accuracy` from
+whole-vector `frontier_vector_agreement`; both must equal `1.0` for the BFS
+check to pass.
+
+## MuSiQue finite-CoT
+
+The MuSiQue runs fully fine-tune GPT-2 without LoRA and explicitly quantize only
+the recurrent state. Read the complete data, token-budget, supervision, access,
+and limitation record in
+[proposal/MUSIQUE_FINITE_COT.md](proposal/MUSIQUE_FINITE_COT.md).
+
+Question-conditioned finite baseline:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=1 run.py \
+  args/finite_cot/musique_gpt2_question_conditioned.yaml
+```
+
+Strict read-once continuation run:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=1 run.py \
+  args/finite_cot/musique_gpt2_strict_continuation.yaml
+```
+
+The resource-sweep launcher holds each retained budget at `B=d*p` while varying
+the configured state precision and recurrent steps. Its dry run writes
+auditable resolved configs and a JSONL manifest without starting training:
+
+```bash
+python experiments/run_musique_resource_sweep.py \
+  args/finite_cot/musique_resource_sweep.yaml --dry-run
 ```
 
 The tests verify finite alphabets and hard codes, prefix sealing, one-query

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 from pathlib import Path
 import sys
@@ -13,41 +14,82 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from finite_cot.data import make_rare_witness_batch
+from finite_cot.experiments import run_rare_witness_experiment
 from finite_cot.models import BinaryPointerMachine, boolean_bfs
-from finite_cot.rare_witness import HypercubeAggregator, sampled_inspection
-from finite_cot.theory import sampling_success
 
 
 def reference_bfs(adjacency: torch.Tensor, source: int, steps: int) -> torch.Tensor:
-    reached = {source}
-    for _ in range(steps):
-        reached |= {
-            v
-            for u in list(reached)
-            for v in adjacency[u].nonzero(as_tuple=False).view(-1).tolist()
-        }
+    """Classical queue-based BFS, truncated after ``steps`` edges."""
+
+    distance = [-1] * adjacency.shape[0]
+    distance[source] = 0
+    queue = deque([source])
+    while queue:
+        u = queue.popleft()
+        if distance[u] == steps:
+            continue
+        for v in adjacency[u].nonzero(as_tuple=False).view(-1).tolist():
+            if distance[v] == -1:
+                distance[v] = distance[u] + 1
+                queue.append(v)
+
     result = torch.zeros(adjacency.shape[0], dtype=torch.bool)
-    result[list(reached)] = True
+    result[[v for v, depth in enumerate(distance) if depth != -1]] = True
     return result
 
 
 def check_bfs() -> dict:
-    cases = agreements = 0
-    for nodes in (16, 32):
-        for edge_probability in (0.02, 0.10):
-            for steps in (2, 4, 8):
-                for seed in (17, 42, 137):
-                    generator = torch.Generator().manual_seed(seed + nodes + steps)
-                    adjacency = (
-                        torch.rand(nodes, nodes, generator=generator) < edge_probability
-                    )
-                    source = torch.tensor([seed % nodes])
+    """Reproduce the 81 configurations reported in the paper."""
+
+    graph_sizes = (32, 64, 128)
+    edge_probabilities = (0.02, 0.05, 0.10)
+    propagation_depths = (4, 8, 16)
+    seeds = (17, 42, 137)
+    cases = exact_agreements = correct_decisions = total_decisions = 0
+    failures = []
+    for nodes in graph_sizes:
+        for edge_probability in edge_probabilities:
+            for seed in seeds:
+                # Reuse one graph across depths so the depth sweep changes only
+                # the number of recurrent updates.
+                generator = torch.Generator().manual_seed(seed)
+                adjacency = (
+                    torch.rand(nodes, nodes, generator=generator) < edge_probability
+                )
+                source = torch.tensor([seed % nodes])
+                for steps in propagation_depths:
                     predicted = boolean_bfs(adjacency.unsqueeze(0), source, steps)[0]
                     expected = reference_bfs(adjacency, int(source), steps)
-                    agreements += int(torch.equal(predicted.cpu(), expected))
+                    matches = predicted.cpu() == expected
+                    correct_decisions += int(matches.sum())
+                    total_decisions += nodes
+                    exact = bool(matches.all())
+                    exact_agreements += int(exact)
                     cases += 1
-    return {"cases": cases, "exact_frontier_agreements": agreements, "passed": cases == agreements}
+                    if not exact:
+                        failures.append(
+                            {
+                                "nodes": nodes,
+                                "edge_probability": edge_probability,
+                                "steps": steps,
+                                "seed": seed,
+                                "mismatched_vertices": int((~matches).sum()),
+                            }
+                        )
+    return {
+        "graph_sizes": list(graph_sizes),
+        "edge_probabilities": list(edge_probabilities),
+        "propagation_depths": list(propagation_depths),
+        "seeds": list(seeds),
+        "cases": cases,
+        "correct_decisions": correct_decisions,
+        "total_decisions": total_decisions,
+        "decision_accuracy": correct_decisions / total_decisions,
+        "exact_frontier_agreements": exact_agreements,
+        "frontier_vector_agreement": exact_agreements / cases,
+        "failures": failures,
+        "passed": cases == exact_agreements,
+    }
 
 
 def check_pointer() -> dict:
@@ -67,21 +109,9 @@ def check_pointer() -> dict:
 
 
 def check_rare_witness() -> dict:
-    dimension = 6
-    branches = 1 << dimension
-    batch = make_rare_witness_batch(branches, 4096, seed=17)
-    full = HypercubeAggregator(dimension).aggregate(batch.markers)
-    generator = torch.Generator().manual_seed(42)
-    sampled = sampled_inspection(batch.markers, branches, generator=generator)
-    empirical = sampled.success.float().mean().item()
-    theoretical = sampling_success(1.0 / branches, branches)
-    return {
-        "full_aggregation_accuracy": (full.prediction == batch.target).float().mean().item(),
-        "sampled_empirical_at_r_eq_k": empirical,
-        "sampled_theory_at_r_eq_k": theoretical,
-        "absolute_error": abs(empirical - theoretical),
-        "passed": abs(empirical - theoretical) < 0.04,
-    }
+    """Run the paper's paired sampling, construction, and precision protocol."""
+
+    return run_rare_witness_experiment({})
 
 
 def main() -> None:

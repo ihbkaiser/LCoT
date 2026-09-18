@@ -1,0 +1,11 @@
+base_config: args/finite_cot/musique_gpt2_strict_continuation.yaml
+name_prefix: musique-gpt2-full-finite-strict
+output_dir: results/musique_resource_sweep
+nproc_per_node: 1
+
+# The runner converts each (B, p) pair into d=B/p and rejects non-integral
+# allocations. T is the number of recurrent finite-state updates.
+budgets: [256, 512, 1024, 2048]
+bits_per_coordinate: [8]
+latent_steps: [4]
+access_modes: [strict_read_once]

@@ -23,6 +23,8 @@ from coconut import Coconut
 from finite_cot.rbs_adapter import StrictFiniteStateCoconut
 from dataset import (
     MyCollator,
+    get_musique_dataset,
+    load_json_or_jsonl,
     get_graph_latent_question_dataset,
     get_graph_no_latent_question_dataset,
     get_graph_latent_cot_dataset,
@@ -384,8 +386,11 @@ def main():
     end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
 
     pretrained_model_id = getattr(configs, "pretrained_model_id", None)
-    uses_lora = pretrained_model_id not in {None, "None", ""}
-    if not uses_lora:
+    has_pretrained_model = pretrained_model_id not in {None, "None", ""}
+    uses_lora = bool(getattr(configs, "use_lora", has_pretrained_model))
+    if uses_lora and not has_pretrained_model:
+        raise ValueError("use_lora requires pretrained_model_id")
+    if not has_pretrained_model:
         if rank == 0:
             print(
                 "Initializing causal LM from model config: "
@@ -523,14 +528,18 @@ def main():
     if rank == 0:
         print(parallel_model)
 
-    answers_val = [
-        d["target"] for d in json.load(open(configs.val_path))
-    ]
+    dataset_name = getattr(configs, "dataset", "prosqa")
+    if dataset_name == "musique":
+        answers_val = [
+            d.get("answer", "") for d in load_json_or_jsonl(configs.val_path)
+        ]
+    else:
+        answers_val = [d["target"] for d in json.load(open(configs.val_path))]
 
     if "gsm" in configs.val_path:
         max_new_tokens = 64
     else:
-        max_new_tokens = 128
+        max_new_tokens = int(getattr(configs, "max_answer_tokens", 128))
 
     total_train_steps = 0
 
@@ -555,6 +564,33 @@ def main():
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
 
+    # MuSiQue tokenization is deterministic and independent of curriculum
+    # epoch. Construct it once; rebuilding train and dev three times per epoch
+    # makes startup appear hung and wastes most of the host-side runtime.
+    musique_datasets = None
+    if dataset_name == "musique":
+        musique_mode = (
+            "cot" if configs.cot else "no_cot" if configs.no_cot else "latent"
+        )
+        if rank == 0:
+            print("Preprocessing MuSiQue splits once (cached for all epochs)...")
+        musique_datasets = {
+            "generation": get_musique_dataset(
+                configs.val_path,
+                configs,
+                tokenizer,
+                musique_mode,
+                question_only=True,
+            )
+        }
+        if not configs.only_eval:
+            musique_datasets["train"] = get_musique_dataset(
+                configs.train_path, configs, tokenizer, musique_mode
+            )
+            musique_datasets["validation"] = get_musique_dataset(
+                configs.val_path, configs, tokenizer, musique_mode
+            )
+
     for epoch in range(configs.resume, configs.num_epochs):
         
         scheduled_stage = (
@@ -563,7 +599,9 @@ def main():
         print("scheduled_stage", scheduled_stage)
         
         if True:
-            if configs.cot or configs.no_cot:
+            if dataset_name == "musique":
+                dataset_gen_val = musique_datasets["generation"]
+            elif configs.cot or configs.no_cot:
                 dataset_gen_val = get_graph_no_latent_question_dataset(
                     configs.val_path,
                     configs,
@@ -588,7 +626,9 @@ def main():
 
         if not configs.only_eval:
 
-            if configs.cot:
+            if dataset_name == "musique":
+                dataset_train = musique_datasets["train"]
+            elif configs.cot:
                 dataset_train = get_graph_cot_dataset(
                     configs.train_path,
                     configs,
@@ -619,7 +659,9 @@ def main():
 
             # the sampler is deterministic even if shuffle is set to True
             # so we have shuffled the dataset when it's constructed (at every epoch).
-            if configs.cot:
+            if dataset_name == "musique":
+                dataset_loss_val = musique_datasets["validation"]
+            elif configs.cot:
                 dataset_loss_val = get_graph_cot_dataset(
                     configs.val_path,
                     configs,
@@ -837,24 +879,24 @@ def main():
                     if configs.cot:
                         outputs = unwrap_parallel_model(parallel_model).generate(
                             **batch,
-                            max_new_tokens=64,
+                            max_new_tokens=max_new_tokens,
                             synced_gpus=world_size > 1 and not configs.only_eval,
                             eos_token_id=tokenizer.eos_token_id,
                         )
                     elif configs.no_cot:
                         outputs = unwrap_parallel_model(parallel_model).generate(
                             **batch,
-                            max_new_tokens=64,
+                            max_new_tokens=max_new_tokens,
                             synced_gpus=world_size > 1 and not configs.only_eval,
                             eos_token_id=tokenizer.eos_token_id,
                         )
                     else:
                         outputs = unwrap_parallel_model(parallel_model).generate(
                             **batch,
-                        max_new_tokens=1,
-                        synced_gpus=world_size > 1 and not configs.only_eval,
-                        eos_token_id=tokenizer.eos_token_id,
-                    )
+                            max_new_tokens=max_new_tokens,
+                            synced_gpus=world_size > 1 and not configs.only_eval,
+                            eos_token_id=tokenizer.eos_token_id,
+                        )
 
                     text_output = tokenizer.decode(outputs[0], skip_special_tokens=True).replace("<eos>", "").strip()
                     answer_output = text_output.split("[A]")[-1].replace(",", "").strip()

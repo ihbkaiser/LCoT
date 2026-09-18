@@ -4,6 +4,7 @@ ckpts/
 *.out
 *.err
 *.png
+!rare_witness.png
 *.pdf
 results/
 *.pyc

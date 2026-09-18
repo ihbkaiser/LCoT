@@ -60,6 +60,16 @@ def finite_config():
     }
 
 
+def strict_config():
+    return {
+        "state_dim": 4,
+        "bits_per_coordinate": 2,
+        "clip_value": 1.0,
+        "learnable_clip": False,
+        "access_mode": "strict_read_once",
+    }
+
+
 class RunLoraTests(unittest.TestCase):
     def test_scheduler_linearly_warms_up_then_cosine_decays(self):
         parameter = torch.nn.Parameter(torch.ones(()))
@@ -273,6 +283,80 @@ class RunLoraTests(unittest.TestCase):
                 if "lora_" in name
             )
         )
+
+    def test_strict_read_once_initializes_before_question(self):
+        model = StrictFiniteStateCoconut(
+            tiny_gpt2(), 33, 31, 32, 38, strict_config()
+        )
+        model.eval()
+        first = torch.tensor([35, 1, 31, 36, 2, 33, 33, 32, 37, 5])
+        second = torch.tensor([35, 1, 31, 36, 3, 33, 33, 32, 37, 5])
+
+        first_effective, first_codes, labels = model._strict_context(first)
+        second_effective, second_codes, _ = model._strict_context(second)
+
+        self.assertIsNone(labels)
+        self.assertEqual(len(first_codes), 3)
+        self.assertEqual(len(second_codes), 3)
+        torch.testing.assert_close(first_codes[0], second_codes[0])
+        torch.testing.assert_close(
+            first_effective[0, :2], model.embedding(first[3:5])
+        )
+        self.assertEqual(model.last_ledger.recurrent_updates, 2)
+        self.assertEqual(model.last_ledger.input_reads, 1)
+        self.assertFalse(model.last_ledger.retains_latent_history)
+
+    def test_strict_read_once_supports_zero_updates(self):
+        model = StrictFiniteStateCoconut(
+            tiny_gpt2(), 33, 31, 32, 38, strict_config()
+        )
+        ids = torch.tensor([35, 1, 31, 36, 2, 32, 37, 5])
+        effective, codes, _ = model._strict_context(ids)
+
+        self.assertEqual(len(codes), 1)
+        self.assertEqual(effective.shape, (1, 5, 16))
+        self.assertEqual(model.last_ledger.recurrent_updates, 0)
+
+    def test_strict_full_finetuning_preserves_base_gradients(self):
+        model = StrictFiniteStateCoconut(
+            tiny_gpt2(), 33, 31, 32, 38, strict_config()
+        )
+        ids = torch.tensor([[35, 1, 31, 36, 2, 33, 33, 32, 37, 5]])
+        labels = torch.full_like(ids, -100)
+        labels[0, -1] = 5
+        output = model(
+            input_ids=ids,
+            attention_mask=torch.ones_like(ids),
+            labels=labels,
+        )
+        output.loss.backward()
+
+        self.assertFalse(any("lora_" in name for name, _ in model.named_parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in model.parameters()))
+        self.assertIsNotNone(model.bottleneck.down.weight.grad)
+        self.assertIsNotNone(model.base_causallm.transformer.wte.weight.grad)
+        self.assertIsNotNone(
+            model.base_causallm.transformer.h[0].attn.c_attn.weight.grad
+        )
+        self.assertEqual(len(model.last_state_codes[0]), 3)
+
+    def test_full_finetuning_checkpoint_round_trip(self):
+        source = StrictFiniteStateCoconut(
+            tiny_gpt2(), 33, 31, 32, 38, strict_config()
+        )
+        target = StrictFiniteStateCoconut(
+            tiny_gpt2(), 33, 31, 32, 38, strict_config()
+        )
+        checkpoint = source.state_dict()
+
+        incompatible = load_training_checkpoint(
+            target, checkpoint, coconut=True, uses_lora=False
+        )
+
+        self.assertEqual(incompatible.missing_keys, [])
+        self.assertEqual(incompatible.unexpected_keys, [])
+        for key, value in checkpoint.items():
+            self.assertTrue(torch.equal(value, target.state_dict()[key]), key)
 
     def test_lora_checkpoint_round_trip(self):
         source = StrictFiniteStateCoconut(

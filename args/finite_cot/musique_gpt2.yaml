@@ -1,0 +1,61 @@
+project: evidencegraph-qa
+save_path: ckpts
+name: musique-gpt2-full-finite-qcond-b256-t4-p4
+
+dataset: musique
+musique_interface: question_conditioned
+only_eval: false
+coconut: true
+cot: false
+no_thoughts: false
+no_cot: false
+
+# Compatibility entry point for the question-conditioned full-finetuning run.
+# A fixed finite-state allocation: B = state_dim * bits_per_coordinate = 256.
+# latent_steps counts recurrent updates; one extra latent initializes the state.
+latent_steps: 4
+c_thought: 2
+epochs_per_stage: 1
+max_latent_stage: 4
+pad_latent_to_max: true
+finite_state:
+  enabled: true
+  state_dim: 64
+  bits_per_coordinate: 4
+  clip_value: 1.0
+  learnable_clip: false
+  access_mode: sealed_prefix
+
+save_only_improve: true
+save_best_only: true
+uniform_prob: 0.0
+model_id: gpt2
+pretrained_model_id: gpt2
+use_lora: false
+tokenizer: gpt2
+require_bpe: true
+load_model_path: None
+
+seed: 17
+resume: 0
+bf16: true
+training_dtype: bfloat16
+train_path: data/musique_ans_v1.0_train.jsonl
+val_path: data/musique_ans_v1.0_dev.jsonl
+distractors: 8
+max_paragraph_tokens: 112
+# GPT-2 has 1,024 positional embeddings. Leave room for the finite boundary,
+# the post-boundary question, and the answer instead of using the 2,048 cap.
+max_prefix_tokens: 896
+max_sequence_tokens: 1024
+max_answer_tokens: 64
+reset_optimizer: false
+batch_size_training: 1
+debug: false
+debug_samples: 128
+show_preprocessing_progress: true
+preprocessing_workers: 8
+gradient_accumulation_steps: 128
+num_epochs: 20
+lr: 1.0e-4
+weight_decay: 0.01

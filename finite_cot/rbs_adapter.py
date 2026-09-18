@@ -1,10 +1,12 @@
 """Strict finite-state adapter for the Reasoning-by-Superposition ProsQA model.
 
 Unlike the original Coconut implementation, this reference path never retains a
-KV cache or a list of earlier latent vectors.  ``readonly_input`` recomputes an
-update from the immutable prefix and the current finite code.  ``sealed_prefix``
+KV cache or a list of earlier latent vectors. ``readonly_input`` recomputes an
+update from the immutable prefix and the current finite code. ``sealed_prefix``
 uses the prefix only to create the initial code and then applies a state-only
-transition.  The implementation favors an auditable contract over throughput.
+transition. ``strict_read_once`` initializes from evidence before the start
+marker, deletes it, and conditions every update on the post-boundary question.
+The implementation favors an auditable contract over throughput.
 """
 
 from __future__ import annotations
@@ -44,8 +46,15 @@ class StrictFiniteStateCoconut(nn.Module):
         self.end_latent_id = int(end_latent_id)
         self.eos_token_id = int(eos_token_id)
         self.access_mode = finite_state.get("access_mode", "readonly_input")
-        if self.access_mode not in {"readonly_input", "sealed_prefix"}:
-            raise ValueError("access_mode must be readonly_input or sealed_prefix")
+        if self.access_mode not in {
+            "readonly_input",
+            "sealed_prefix",
+            "strict_read_once",
+        }:
+            raise ValueError(
+                "access_mode must be readonly_input, sealed_prefix, or "
+                "strict_read_once"
+            )
         if isinstance(base_causallm, GPT2LMHeadModel):
             self.embedding = base_causallm.transformer.get_input_embeddings()
         else:
@@ -57,7 +66,7 @@ class StrictFiniteStateCoconut(nn.Module):
             state_dim=int(finite_state["state_dim"]),
             bits=int(
                 finite_state.get(
-                    "model_bits", finite_state.get("bits_per_coordinate", 2)
+                    "bits_per_coordinate", finite_state.get("model_bits", 2)
                 )
             ),
             clip_value=float(finite_state.get("clip_value", 1.0)),
@@ -122,9 +131,144 @@ class StrictFiniteStateCoconut(nn.Module):
         kept_labels = labels[keep] if labels is not None else None
         return ids, kept_labels
 
+    def _strict_context(
+        self, ids: Tensor, labels: Tensor | None = None
+    ) -> Tuple[Tensor, List[Tensor], Tensor | None]:
+        """Build a question-conditioned state after sealing evidence once.
+
+        Layout: evidence, START, question, LATENT * T, END, answer prompt/tail.
+        START is the read-once boundary. The structural markers and evidence are
+        absent from the effective decoder context.
+        """
+
+        start_positions = (ids == self.start_latent_id).nonzero(
+            as_tuple=False
+        ).view(-1)
+        end_positions = (ids == self.end_latent_id).nonzero(
+            as_tuple=False
+        ).view(-1)
+        if start_positions.numel() != 1 or end_positions.numel() != 1:
+            raise ValueError(
+                "strict_read_once requires exactly one start and one end marker"
+            )
+        start = int(start_positions[0])
+        end = int(end_positions[0])
+        if start == 0 or start >= end:
+            raise ValueError("strict_read_once requires evidence before the boundary")
+
+        latent_positions = (ids == self.latent_token_id).nonzero(
+            as_tuple=False
+        ).view(-1)
+        if latent_positions.numel() and not bool(
+            ((latent_positions > start) & (latent_positions < end)).all()
+        ):
+            raise ValueError("all strict latent markers must lie inside the boundary")
+        first_latent = int(latent_positions[0]) if latent_positions.numel() else end
+        continuation_ids = ids[start + 1 : first_latent]
+        if continuation_ids.numel() == 0:
+            raise ValueError("strict_read_once requires a post-boundary continuation")
+        evidence_ids = ids[:start]
+        tail_ids = ids[end + 1 :]
+
+        evidence_embeds = self.embedding(evidence_ids).unsqueeze(0)
+        initial_hidden = self._base(evidence_embeds, hidden=True).hidden_states[-1][
+            :, -1, :
+        ]
+        state_q = self.bottleneck.compress(initial_hidden)
+        state = state_q.value
+        codes = [state_q.codes]
+        continuation_embeds = self.embedding(continuation_ids).unsqueeze(0)
+
+        for _ in range(int(latent_positions.numel())):
+            update_input = torch.cat(
+                (continuation_embeds, self.bottleneck.expand(state).unsqueeze(1)),
+                dim=1,
+            )
+            updated_hidden = self._base(update_input, hidden=True).hidden_states[-1][
+                :, -1, :
+            ]
+            state_q = self.bottleneck.compress(updated_hidden)
+            state = state_q.value
+            codes.append(state_q.codes)
+
+        state_embed = self.bottleneck.expand(state).unsqueeze(1)
+        tail_embeds = self.embedding(tail_ids).unsqueeze(0)
+        effective = torch.cat(
+            (continuation_embeds, state_embed, tail_embeds), dim=1
+        )
+        effective_labels = None
+        if labels is not None:
+            state_label = labels.new_full((1,), -100)
+            effective_labels = torch.cat(
+                (labels[start + 1 : first_latent], state_label, labels[end + 1 :])
+            )
+
+        self.last_ledger = ResourceLedger(
+            state_dim=self.bottleneck.state_dim,
+            bits_per_coordinate=self.bottleneck.bits,
+            recurrent_updates=int(latent_positions.numel()),
+            access_model=self.access_mode,
+            input_reads=1,
+            retains_latent_history=False,
+            notes=(
+                "evidence read once; every update sees only the shared "
+                "continuation and current hard code; no past_key_values"
+            ),
+        )
+        return effective, codes, effective_labels
+
+    def _strict_forward(self, input_ids, attention_mask, labels) -> Outputs:
+        effective_sequences = []
+        effective_labels = []
+        all_codes = []
+        for index in range(input_ids.shape[0]):
+            ids, kept_labels = self._trim_example(
+                input_ids[index],
+                attention_mask[index],
+                labels[index] if labels is not None else None,
+            )
+            effective, codes, mapped_labels = self._strict_context(ids, kept_labels)
+            effective_sequences.append(effective.squeeze(0))
+            effective_labels.append(mapped_labels)
+            all_codes.append(codes)
+
+        lengths = torch.tensor(
+            [sequence.shape[0] for sequence in effective_sequences],
+            device=input_ids.device,
+            dtype=torch.long,
+        )
+        effective = pad_sequence(effective_sequences, batch_first=True)
+        positions = torch.arange(effective.shape[1], device=input_ids.device)
+        effective_mask = positions.unsqueeze(0) < lengths.unsqueeze(1)
+        self.gen_forward_cnt += 1
+        outputs = self.base_causallm(
+            inputs_embeds=effective,
+            attention_mask=effective_mask,
+            use_cache=False,
+        )
+
+        if labels is None:
+            loss = outputs.logits.sum() * 0.0
+        else:
+            mapped = pad_sequence(
+                effective_labels, batch_first=True, padding_value=-100
+            )
+            loss = F.cross_entropy(
+                outputs.logits[:, :-1].flatten(0, 1),
+                mapped[:, 1:].flatten(),
+                ignore_index=-100,
+            )
+        self.last_state_codes = [
+            [code.detach() for code in trace] for trace in all_codes
+        ]
+        return Outputs(loss=loss, inputs_embeds=effective, logits=outputs.logits)
+
     def _finite_context(
         self, ids: Tensor
     ) -> Tuple[Tensor, List[Tensor], int, int]:
+        if self.access_mode == "strict_read_once":
+            effective, codes, _ = self._strict_context(ids)
+            return effective, codes, -1, 0
         latent_positions = (ids == self.latent_token_id).nonzero(as_tuple=False).view(-1)
         if latent_positions.numel() == 0:
             return self.embedding(ids).unsqueeze(0), [], -1, 0
@@ -206,6 +350,8 @@ class StrictFiniteStateCoconut(nn.Module):
     def forward(
         self, input_ids, attention_mask, labels, position_ids=None, **kwargs
     ) -> Outputs:
+        if self.access_mode == "strict_read_once":
+            return self._strict_forward(input_ids, attention_mask, labels)
         trimmed_ids = []
         trimmed_labels = []
         prefixes: List[Tensor | None] = []

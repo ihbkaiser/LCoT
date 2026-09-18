@@ -1,10 +1,14 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import itertools
 import random
+import re
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -13,6 +17,278 @@ from datasets import Dataset
 from transformers import PreTrainedTokenizerBase
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 import random
+
+
+def load_json_or_jsonl(dataset_path):
+    """Load the JSON arrays used by ProsQA or an official JSONL QA split."""
+
+    path = Path(dataset_path)
+    if path.suffix == ".jsonl":
+        with path.open(encoding="utf-8") as stream:
+            return [json.loads(line) for line in stream if line.strip()]
+    with path.open(encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def validate_bpe_tokenizer(tokenizer):
+    """Reject a non-BPE tokenizer when an experiment promises BPE accounting."""
+
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    model = getattr(backend, "model", None)
+    model_name = type(model).__name__.lower() if model is not None else ""
+    if "bpe" not in model_name:
+        raise ValueError(
+            "MuSiQue requires a fast BPE tokenizer so paragraph and prefix "
+            f"budgets are measured consistently; got {type(tokenizer).__name__} "
+            f"with backend model {type(model).__name__}."
+        )
+
+
+def _encode(tokenizer, text):
+    # ``verbose=False`` avoids a misleading model_max_length warning while we
+    # are still measuring candidates that will be cropped before model input.
+    return tokenizer.encode(text, add_special_tokens=False, verbose=False)
+
+
+def _decode(tokenizer, token_ids):
+    return tokenizer.decode(token_ids, skip_special_tokens=False)
+
+
+def _sentence_spans(text):
+    # MuSiQue paragraphs are Wikipedia prose. This intentionally avoids an
+    # external sentence-tokenizer dependency while retaining punctuation.
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+
+
+def _crop_musique_paragraph(paragraph, support_answers, tokenizer, max_tokens):
+    """BPE-crop a paragraph around its answer-bearing evidence sentence."""
+
+    title = paragraph.get("title", "")
+    text = paragraph.get("paragraph_text", "")
+    full_rendered = f"{title}: {text}"
+    full_ids = _encode(tokenizer, full_rendered)
+    if len(full_ids) <= max_tokens:
+        return _decode(tokenizer, full_ids).strip()
+
+    sentences = _sentence_spans(text)
+    lowered_answers = [str(answer).casefold() for answer in support_answers if answer]
+    evidence_index = next(
+        (
+            index
+            for index, sentence in enumerate(sentences)
+            if any(answer in sentence.casefold() for answer in lowered_answers)
+        ),
+        0,
+    )
+    order = [evidence_index]
+    for distance in range(1, len(sentences)):
+        for index in (evidence_index - distance, evidence_index + distance):
+            if 0 <= index < len(sentences):
+                order.append(index)
+
+    selected = []
+    for index in order:
+        candidate = sorted(selected + [index])
+        rendered = f"{title}: " + " ".join(sentences[i] for i in candidate)
+        if len(_encode(tokenizer, rendered)) <= max_tokens:
+            selected.append(index)
+    if selected:
+        rendered = f"{title}: " + " ".join(sentences[i] for i in sorted(selected))
+    else:
+        rendered = f"{title}: {text}"
+    ids = _encode(tokenizer, rendered)[:max_tokens]
+    return _decode(tokenizer, ids).strip()
+
+
+def _musique_parts(sample, tokenizer, configs):
+    """Return capped evidence, the post-boundary question, and hop targets."""
+
+    if not sample.get("answerable", True):
+        raise ValueError(f"MuSiQue example {sample.get('id')} is not answerable")
+    decomposition = sample.get("question_decomposition", [])
+    answer = str(sample.get("answer", "")).strip()
+    if not decomposition or not answer:
+        raise ValueError(f"MuSiQue example {sample.get('id')} lacks labels")
+
+    support_by_idx = {}
+    for hop in decomposition:
+        support_by_idx.setdefault(hop["paragraph_support_idx"], []).append(hop["answer"])
+    paragraphs = {paragraph["idx"]: paragraph for paragraph in sample["paragraphs"]}
+    # Evidence lock: every bridge/final hop must occur in its labeled paragraph.
+    for support_idx, hop_answers in support_by_idx.items():
+        support_text = paragraphs[support_idx]["paragraph_text"].casefold()
+        if any(str(hop_answer).casefold() not in support_text for hop_answer in hop_answers):
+            raise ValueError(
+                f"MuSiQue example {sample.get('id')} has an ungrounded bridge"
+            )
+
+    distractor_count = int(getattr(configs, "distractors", 0))
+    if distractor_count not in {0, 4, 8, 12}:
+        raise ValueError("distractors must be one of 0, 4, 8, or 12")
+    gold = [paragraphs[index] for index in support_by_idx]
+    distractors = [
+        paragraph
+        for paragraph in sample["paragraphs"]
+        if paragraph["idx"] not in support_by_idx
+    ][:distractor_count]
+    paragraph_cap = int(getattr(configs, "max_paragraph_tokens", 112))
+    gold_text = [
+        _crop_musique_paragraph(
+            paragraph, support_by_idx[paragraph["idx"]], tokenizer, paragraph_cap
+        )
+        for paragraph in gold
+    ]
+    distractor_text = [
+        _crop_musique_paragraph(paragraph, [], tokenizer, paragraph_cap)
+        for paragraph in distractors
+    ]
+
+    prefix_cap = int(getattr(configs, "max_prefix_tokens", 2048))
+
+    def render(passages):
+        evidence = " ".join(
+            f"[PASSAGE {index}] {passage}" for index, passage in enumerate(passages)
+        )
+        return f"<eos> [EVIDENCE] {evidence}"
+
+    # Remove distractors before touching gold evidence, as required by the
+    # evidence-locked protocol.
+    kept_distractors = list(distractor_text)
+    prefix = render(gold_text + kept_distractors)
+    while kept_distractors and len(_encode(tokenizer, prefix)) > prefix_cap:
+        kept_distractors.pop()
+        prefix = render(gold_text + kept_distractors)
+    prefix_ids = _encode(tokenizer, prefix)
+    if len(prefix_ids) > prefix_cap:
+        # Gold is never silently removed. Token-level clipping is the final
+        # fallback after all distractors have gone.
+        prefix_ids = _encode(tokenizer, render(gold_text))[:prefix_cap]
+        prefix = _decode(tokenizer, prefix_ids)
+
+    hops = [str(hop["answer"]).strip() for hop in decomposition]
+    return prefix, f" [Q] {sample['question']}", hops, answer
+
+
+def get_musique_dataset(dataset_path, configs, tokenizer, mode, question_only=False):
+    """Build finite-CoT examples from the official MuSiQue answerable JSONL."""
+
+    if getattr(configs, "require_bpe", True):
+        validate_bpe_tokenizer(tokenizer)
+    base_dataset = load_json_or_jsonl(dataset_path)
+    if configs.debug:
+        base_dataset = base_dataset[: int(getattr(configs, "debug_samples", 128))]
+    max_sequence_tokens = int(getattr(configs, "max_sequence_tokens", 2304))
+    recurrent_updates = int(getattr(configs, "latent_steps", 4))
+    musique_interface = getattr(
+        configs, "musique_interface", "question_conditioned"
+    )
+    if musique_interface not in {"question_conditioned", "strict_continuation"}:
+        raise ValueError(
+            "musique_interface must be question_conditioned or strict_continuation"
+        )
+    preprocessing_workers = int(getattr(configs, "preprocessing_workers", 1))
+    if preprocessing_workers < 1:
+        raise ValueError("preprocessing_workers must be positive")
+    processed = []
+    started = time.monotonic()
+    show_progress = bool(getattr(configs, "show_preprocessing_progress", True))
+
+    def process_one(index_and_sample):
+        source_index, sample = index_and_sample
+        try:
+            evidence, question, hops, answer = _musique_parts(
+                sample, tokenizer, configs
+            )
+        except ValueError:
+            # Filtering is explicit at dataset construction; preprocessing
+            # manifests can record these IDs in a full evidence-lock run.
+            return None
+        if mode == "cot":
+            prompt = evidence + question + " [REASONING]"
+            continuation = " " + " -> ".join(hops) + f" [A] {answer} <eos>"
+        elif mode == "no_cot":
+            prompt = evidence + question + " [A]"
+            continuation = f" {answer} <eos>"
+        elif mode == "latent":
+            if musique_interface == "question_conditioned":
+                # Existing sealed-prefix interface: the first latent initializes
+                # z_0 from evidence + question; the remaining T latents update it.
+                suffix = (
+                    question
+                    + " <|start-latent|>"
+                    + " <|latent|>" * (recurrent_updates + 1)
+                    + " <|end-latent|> [A]"
+                )
+            else:
+                # Strict continuation interface: initialize z_0 from evidence at
+                # the boundary, then let exactly T updates read the question.
+                suffix = (
+                    " <|start-latent|>"
+                    + question
+                    + " <|latent|>" * recurrent_updates
+                    + " <|end-latent|> [A]"
+                )
+            prompt = evidence + suffix
+            continuation = f" {answer} <eos>"
+        else:
+            raise ValueError(f"unknown MuSiQue mode: {mode}")
+
+        prompt_ids = _encode(tokenizer, prompt)
+        continuation_ids = [] if question_only else _encode(tokenizer, continuation)
+        if len(prompt_ids) + len(continuation_ids) > max_sequence_tokens:
+            # Evidence is first and gold passages precede distractors. Preserve
+            # the complete question, boundary, latent markers, and answer prompt.
+            if mode == "latent":
+                suffix_ids = _encode(tokenizer, suffix)
+                evidence_budget = (
+                    max_sequence_tokens - len(suffix_ids) - len(continuation_ids)
+                )
+                if evidence_budget < 1:
+                    return None
+                prompt_ids = _encode(tokenizer, evidence)[:evidence_budget] + suffix_ids
+            else:
+                prompt_ids = prompt_ids[: max_sequence_tokens - len(continuation_ids)]
+        tokens = prompt_ids + continuation_ids
+        item = {
+            "input_ids": tokens,
+            "attention_mask": [1] * len(tokens),
+            "position_ids": list(range(len(tokens))),
+        }
+        if question_only:
+            item["idx"] = source_index
+        else:
+            item["labels"] = [-100] * len(prompt_ids) + continuation_ids
+        return item
+
+    indexed_samples = enumerate(base_dataset)
+    executor = None
+    if preprocessing_workers == 1:
+        results = map(process_one, indexed_samples)
+    else:
+        executor = ThreadPoolExecutor(max_workers=preprocessing_workers)
+        results = executor.map(process_one, indexed_samples)
+    try:
+        for source_index, item in enumerate(results):
+            if item is not None:
+                processed.append(item)
+            if show_progress and (source_index + 1) % 1000 == 0:
+                print(
+                    f"MuSiQue preprocessing {Path(dataset_path).name}: "
+                    f"{source_index + 1}/{len(base_dataset)} source examples "
+                    f"({preprocessing_workers} workers)",
+                    flush=True,
+                )
+    finally:
+        if executor is not None:
+            executor.shutdown()
+    if show_progress:
+        print(
+            f"MuSiQue preprocessing complete for {Path(dataset_path).name}: "
+            f"retained {len(processed)}/{len(base_dataset)} examples in "
+            f"{time.monotonic() - started:.1f}s with {preprocessing_workers} workers",
+            flush=True,
+        )
+    return processed
 
 
 @dataclass
