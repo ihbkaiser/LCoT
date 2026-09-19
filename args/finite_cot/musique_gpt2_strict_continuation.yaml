@@ -45,13 +45,13 @@ max_prefix_tokens: 896
 max_sequence_tokens: 1024
 max_answer_tokens: 64
 reset_optimizer: false
-batch_size_training: 4
+batch_size_training: 8
 debug: false
 debug_samples: 128
 show_preprocessing_progress: true
 preprocessing_workers: 8
 dataloader_workers: 0
-gradient_accumulation_steps: 32
+gradient_accumulation_steps: 8
 num_epochs: 200
 eval_every_n_epochs: 20
 lr: 1.0e-4
